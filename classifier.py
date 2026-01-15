@@ -29,13 +29,14 @@ except ImportError:
 # ==========================================
 
 # 日志配置
-LOG_DIR = Path("MCOT/Vertical_Flow/log/log_classify")
+LOG_DIR = Path("VerticalFlow/log/log_classify")
 LOGGER = None  # 运行时在 main 中初始化
 ORIGINAL_PRINT = print
 
 # --- 1. 数据配置 ---
 # DATA_FILE_PATH = 'results/results-Qwen3-0p6B'
-DATA_FILE_PATH = 'MCOT/Vertical_Flow/results/mul_num2len5_Qwen3-8B/mul_num2len5_Qwen3-8B'
+DATA_FILE_PATH = 'VerticalFlow/results/plus_num3len10_Qwen3-4b/plus_num3len10_Qwen3-4b'
+# DATA_FILE_PATH = 'VerticalFlow/results/mul_num2len5_Qwen3-4b/mul_num2len5_Qwen3-4b'
 # DATA_FILE_PATH = 'results/mul_num3len3_Qwen3-4B-Instruct-2507'
 # DATA_FILE_PATH = 'results/plus_num3len10_Qwen3-4B-Instruct-2507'
 # DATA_FILE_PATH = 'results/plus_num5len20_Qwen3-4B-Instruct-2507'
@@ -60,7 +61,7 @@ POOLING_TYPE = 'None'    # None, 'avg', 'max'
 
 # 按层评估开关
 # 打开后会逐层训练/验证，每层单独跑一遍完整训练流程，取验证集 AUC 最高的 epoch 作为该层得分
-EVALUATE_EACH_LAYER = False
+EVALUATE_EACH_LAYER = True
 SPECIFIC_LAYER_INDEX = None    # None, 0, 1, 2, ...
 
 # 按位置评估开关
@@ -80,12 +81,12 @@ SEED = 42                        # 随机种子
 CIRCULAR_PROBE_EPOCHS = 300    # CircularProbe训练epoch数（不使用early stopping）
 
 # --- 3. 模型选择 ---
-# 可选: 'mlp', 'transformer', 'logreg', 'ar_transformer', 'lstm', 'circular_probe', 'spiral_probe'
-MODEL_TYPE = 'spiral_probe'
+# 可选: 'mlp', 'mlp10', 'transformer', 'logreg', 'ar_transformer', 'lstm', 'circular_probe', 'spiral_probe'
+MODEL_TYPE = 'mlp10'
 
 # --- 3.1 模型存储 ---
 SAVE_MODEL = False               # 是否在训练结束后保存模型
-SAVE_DIR = 'MCOT/Vertical_Flow/saved_models'        # 模型保存目录
+SAVE_DIR = 'VerticalFlow/saved_models'        # 模型保存目录
 SAVE_NAME = DATA_FILE_PATH.split('/')[-1]
 
 # --- 4. MLP模型参数 ---
@@ -1114,6 +1115,13 @@ def create_model(input_dim, seq_len, feature_dim, num_classes=2):
             dropout=MLP_DROPOUT,
             num_classes=num_classes
         ).to(DEVICE)
+    if MODEL_TYPE == 'mlp10':
+        return ProbeMLP(
+            input_dim=input_dim,
+            hidden_dim=MLP_HIDDEN_DIM,
+            dropout=MLP_DROPOUT,
+            num_classes=num_classes
+        ).to(DEVICE)
     if MODEL_TYPE == 'transformer':
         return TransformerClassifier(
             input_dim=input_dim,
@@ -1197,7 +1205,7 @@ def create_model(input_dim, seq_len, feature_dim, num_classes=2):
 
 
 def evaluate(model, data_loader, criterion):
-    """在验证集上评估，返回指标字典"""
+    """在验证集上评估，返回指标字典（支持二分类与多分类）"""
     model.eval()
     all_preds = []
     all_labels = []
@@ -1210,7 +1218,7 @@ def evaluate(model, data_loader, criterion):
             outputs = model(inputs)
             loss = criterion(outputs, labels)
             total_loss += loss.item()
-            probs = torch.softmax(outputs, dim=1)[:, 1]
+            probs = torch.softmax(outputs, dim=1)
             _, preds = torch.max(outputs, 1)
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
@@ -1218,8 +1226,16 @@ def evaluate(model, data_loader, criterion):
     
     loss_avg = total_loss / len(data_loader)
     acc = accuracy_score(all_labels, all_preds)
-    auc = roc_auc_score(all_labels, all_probs)
-    f1 = f1_score(all_labels, all_preds, pos_label=0)
+    # 根据类别数量选择合适的评估方式
+    num_classes = all_probs[0].shape[-1] if all_probs else 2
+    if num_classes == 2:
+        # 二分类：使用第1类概率计算ROC-AUC；F1以正类=0保持向后兼容
+        auc = roc_auc_score(all_labels, [p[1] for p in all_probs])
+        f1 = f1_score(all_labels, all_preds, pos_label=0)
+    else:
+        # 多分类：使用macro OVR的ROC-AUC与macro F1
+        auc = roc_auc_score(all_labels, np.array(all_probs), multi_class='ovr')
+        f1 = f1_score(all_labels, all_preds, average='macro')
     
     return {
         "loss": loss_avg,
@@ -1236,7 +1252,8 @@ def train_single_run(X_train, y_train, pos_train, X_val, y_val, pos_val, seq_len
     label_prefix: 日志前缀，便于按层评估时区分输出
     """
     input_dim = X_train.shape[1]
-    num_classes = 2
+    # 动态确定类别数（适配二分类与多分类）
+    num_classes = int(torch.unique(y_train).numel())
     
     train_dataset = TensorDataset(X_train, y_train, pos_train)
     val_dataset = TensorDataset(X_val, y_val, pos_val)
@@ -1647,13 +1664,31 @@ def main():
         pca_dim=PCA_DIM
     )
     
-    # 数据平衡
-    if STRONG_BALANCE_BY_POSITION:
-        X_all, y_all, position_indices = balance_dataset_per_position(
-            X_all, y_all, position_indices, position_names=selected_positions
-        )
-    elif BALANCE_DATASET:
-        X_all, y_all, position_indices = balance_dataset(X_all, y_all, position_indices)
+    # 若为10类MLP，使用数据中的 gt_chars 作为标签，并过滤无效样本
+    if MODEL_TYPE == 'mlp10':
+        print("使用10类MLP：标签采用数据文件中的 gt_chars (0-9)")
+        valid_mask = (gt_chars_all >= 0) & (gt_chars_all < 10)
+        kept = int(valid_mask.sum().item())
+        dropped = int((~valid_mask).sum().item())
+        if dropped > 0:
+            print(f"  过滤无效标签样本: 保留 {kept}，舍弃 {dropped}（gt_chars为-1或不在0-9）")
+        X_all = X_all[valid_mask]
+        y_all = gt_chars_all[valid_mask]
+        position_indices = position_indices[valid_mask]
+        gt_chars_all = gt_chars_all[valid_mask]
+        preds_all = preds_all[valid_mask]
+    
+    # 数据平衡（仅适用于二分类）。多分类时跳过。
+    if MODEL_TYPE != 'mlp10':
+        if STRONG_BALANCE_BY_POSITION:
+            X_all, y_all, position_indices = balance_dataset_per_position(
+                X_all, y_all, position_indices, position_names=selected_positions
+            )
+        elif BALANCE_DATASET:
+            X_all, y_all, position_indices = balance_dataset(X_all, y_all, position_indices)
+    else:
+        if STRONG_BALANCE_BY_POSITION or BALANCE_DATASET:
+            print("提示: mlp10 为多分类任务，已跳过二分类的平衡步骤。")
     
     # 数据划分
     indices = np.arange(len(X_all))
@@ -1757,15 +1792,16 @@ def main():
                 for inputs, labels, pos_idx in val_loader:
                     inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
                     outputs = model(inputs)
-                    # 针对二分类softmax,取第1类的概率；如logits则先softmax
-                    if outputs.shape[1] == 2:
-                        probs = torch.softmax(outputs, dim=1)[:, 1].cpu().numpy()
-                    else:
-                        probs = torch.sigmoid(outputs).squeeze(dim=1).cpu().numpy()
-                    for idx_tensor, prob, label in zip(pos_idx, probs, labels.cpu().numpy()):
-                        idx = int(idx_tensor.item())
-                        per_pos_probs[idx].append(prob)
-                        per_pos_labels[idx].append(label)
+                    probs_full = torch.softmax(outputs, dim=1).cpu().numpy()
+                    pos_idx_np = pos_idx.cpu().numpy()
+                    labels_np = labels.cpu().numpy()
+                    for i in range(len(pos_idx_np)):
+                        idx = int(pos_idx_np[i])
+                        if probs_full.shape[1] == 2:
+                            per_pos_probs[idx].append(probs_full[i, 1])
+                        else:
+                            per_pos_probs[idx].append(probs_full[i])
+                        per_pos_labels[idx].append(labels_np[i])
 
             for idx, pos in enumerate(selected_positions):
                 y_true = np.array(per_pos_labels[idx])
@@ -1775,7 +1811,11 @@ def main():
                 elif len(np.unique(y_true)) < 2:
                     print(f"  位置 {pos}: 仅有一种标签，无法计算AUC")
                 else:
-                    auc = roc_auc_score(y_true, y_score)
+                    if MODEL_TYPE == 'mlp10':
+                        # 多分类：macro OVR AUC
+                        auc = roc_auc_score(y_true, y_score, multi_class='ovr')
+                    else:
+                        auc = roc_auc_score(y_true, y_score)
                     print(f"  位置 {pos}: 验证AUC {auc:.4f} (样本数 {len(y_true)})")
     
             
@@ -1787,7 +1827,10 @@ def main():
                 all_probs.extend(per_pos_probs[idx])
             
             if len(all_labels) > 0 and len(np.unique(all_labels)) >= 2:
-                overall_auc = roc_auc_score(all_labels, all_probs)
+                if MODEL_TYPE == 'mlp10':
+                    overall_auc = roc_auc_score(all_labels, np.array(all_probs), multi_class='ovr')
+                else:
+                    overall_auc = roc_auc_score(all_labels, all_probs)
                 print(f"\n  总体验证AUC: {overall_auc:.4f} (总样本数 {len(all_labels)})")
     elif EVALUATE_EACH_POSITION and not EVALUATE_EACH_LAYER:
         # 按位置评估

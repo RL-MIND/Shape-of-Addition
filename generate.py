@@ -9,7 +9,7 @@ import numpy as np
 import h5py
 from datetime import datetime
 from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, Qwen3ForCausalLM
 
 
 # ===========================
@@ -21,7 +21,7 @@ DEVICE = 'auto'
 
 # 模型路径
 # MODEL_NAME = "/data0/wenliuyuan/models/Qwen3-0.6B"
-MODEL_NAME = "Models/Qwen3-8B"
+MODEL_NAME = "/data/Models/Qwen3-4b"
 # MODEL_NAME = "/data0/wenliuyuan/models/Qwen3-8B"
 # MODEL_NAME = "/data0/wenliuyuan/models/Qwen3-30B-A3B-Instruct-2507"
 
@@ -31,10 +31,10 @@ MODEL_NAME = "Models/Qwen3-8B"
 # DATA_PATH = '/home/wenliuyuan/llm/vertical-flow/dataset/num2len10-10000.pkl'
 # DATA_PATH = '/home/wenliuyuan/llm/vertical-flow/dataset/num3len3-10000.pkl'
 # DATA_PATH = '/home/wenliuyuan/llm/vertical-flow/dataset/num3len10-10000.pkl'
-DATA_PATH = 'VerticalFlow/num2len5-10000.pkl'
+DATA_PATH = 'VerticalFlow/num3len10-10000.pkl'
 
 # 运算符配置
-SIGN = 'mul'  # 'plus', 'mul', 'sub', 'div'
+SIGN = 'plus'  # 'plus', 'mul', 'sub', 'div'
 
 # 生成配置
 MAX_NEW_TOKENS = 25
@@ -59,7 +59,7 @@ RESULTS_PATH_H5 = "VerticalFlow/results/" + SIGN + "_" + DATA_PATH.split("/")[-1
 ENABLE_FINAL_PICKLE_EXPORT = False
 
 # 日志目录
-LOG_DIR = "./Vertical Flow/log/log_generate"
+LOG_DIR = "./VerticalFlow/log/log_generate"
 
 
 # ===========================
@@ -310,6 +310,37 @@ def parse_operands(data_item, data_idx=None):
     return operands
 
 
+def _digits_lsd(num):
+    """将数字拆成从低位到高位的数字列表。"""
+    return [int(ch) for ch in str(abs(int(num)))[::-1]]
+
+
+def compute_plus_in_carries_and_column_sums(operands, result_len):
+    """计算加法时每一位（按输出顺序）对应的进位和各位数字和。"""
+    digit_lists = [_digits_lsd(op) for op in operands]
+    max_len = max(max(len(d) for d in digit_lists), result_len)
+
+    carries_lsd = []
+    column_sums_lsd = []
+    carry = 0
+
+    for i in range(max_len):
+        column_sum = sum(d[i] if i < len(d) else 0 for d in digit_lists)
+        column_sums_lsd.append(column_sum)
+        carries_lsd.append(carry)
+        carry = (column_sum + carry) // 10
+
+    while len(carries_lsd) < result_len:
+        column_sums_lsd.append(0)
+        carries_lsd.append(carry)
+        carry = carry // 10
+
+    carries_lsd = carries_lsd[:result_len]
+    column_sums_lsd = column_sums_lsd[:result_len]
+
+    return list(reversed(carries_lsd)), list(reversed(column_sums_lsd))
+
+
 def encode_position_counters(counters):
     """将位置计数字典转为可序列化形式（键转字符串）。"""
     encoded = {}
@@ -428,7 +459,7 @@ def load_progress_from_h5(path):
         return processed_samples, processed_samples, sample_correct, token_total, token_correct, position_counters
 
 
-def check_all_tokens(gen_content_tokens_readable, hidden_states, operands, op_func, check_all=True, prenorm_states=None):
+def check_all_tokens(gen_content_tokens_readable, hidden_states, operands, op_func, check_all=True, prenorm_states=None, sign=None):
     """
     逐个token判断正确性，跳过逗号，直到正确答案结束
     
@@ -445,6 +476,11 @@ def check_all_tokens(gen_content_tokens_readable, hidden_states, operands, op_fu
     返回: list of dict
     """
     gt_str = str(op_func(operands))
+    is_plus = (sign == 'plus') if sign is not None else (SIGN == 'plus')
+    true_in_carries = []
+    column_sums = []
+    if is_plus:
+        true_in_carries, column_sums = compute_plus_in_carries_and_column_sums(operands, len(gt_str))
     results = []
     gt_idx = 0
     all_gt_correct = True
@@ -475,12 +511,22 @@ def check_all_tokens(gen_content_tokens_readable, hidden_states, operands, op_fu
                 'correct': correct,
                 'flow': flow,
                 'is_extra': True,
+                'true_in_carry': float('nan'),
+                'pred_in_carry': float('nan'),
             })
             break
         else:
             # 正常位：与gt比较
             gt_char = gt_str[gt_idx]
             correct = (token.strip() == gt_char)
+
+            true_carry = float(true_in_carries[gt_idx]) if (is_plus and gt_idx < len(true_in_carries)) else float('nan')
+            if is_plus and gt_idx < len(column_sums) and token.strip().isdigit():
+                pred_value = int(token.strip())
+                # 预测进位 = (预测数字 - (该位加数之和 mod 10)) mod 10
+                pred_carry = float((pred_value - (int(column_sums[gt_idx]) % 10)) % 10)
+            else:
+                pred_carry = float('nan')
             
             results.append({
                 'gen_idx': gen_idx,
@@ -490,6 +536,8 @@ def check_all_tokens(gen_content_tokens_readable, hidden_states, operands, op_fu
                 'correct': correct,
                 'flow': flow,
                 'is_extra': False,
+                'true_in_carry': true_carry,
+                'pred_in_carry': pred_carry,
             })
             
             if not correct:
@@ -524,6 +572,8 @@ def check_all_tokens(gen_content_tokens_readable, hidden_states, operands, op_fu
                 'correct': correct,
                 'flow': flow,
                 'is_extra': True,
+                'true_in_carry': float('nan'),
+                'pred_in_carry': float('nan'),
             })
             break
     
@@ -612,6 +662,14 @@ class HDF5IncrementalWriter:
                     str_dtype = h5py.string_dtype(encoding="utf-8")
                     gt_array = np.asarray(pos_data["gt_chars"], dtype=str_dtype)
                     self._append_dataset(pos_group, "gt_chars", gt_array, dtype=str_dtype)
+
+                if pos_data.get("true_in_carry"):
+                    tic_array = np.asarray(pos_data["true_in_carry"], dtype=np.float32)
+                    self._append_dataset(pos_group, "true_in_carry", tic_array)
+
+                if pos_data.get("pred_in_carry"):
+                    pic_array = np.asarray(pos_data["pred_in_carry"], dtype=np.float32)
+                    self._append_dataset(pos_group, "pred_in_carry", pic_array)
 
     def append_sample_input_ids(self, sample_idx, input_ids):
         """将样本的 input_ids 存储到 HDF5 的 samples 组。"""
@@ -821,7 +879,8 @@ def main():
             generate_outputs.hidden_states, 
             operands, op_func,
             check_all=CHECK_ALL_TOKENS,
-            prenorm_states=CAPTURED_PRENORM_STATES
+            prenorm_states=CAPTURED_PRENORM_STATES,
+            sign=SIGN,
         )
         
         # 计算整体正确性
@@ -867,11 +926,15 @@ def main():
                         'preds': [],
                         'gt_chars': [],
                         'is_extra': tr.get('is_extra', False),
+                        'true_in_carry': [],
+                        'pred_in_carry': [],
                     }
                 target_token_results[key]['flows'].append(tr['flow'].numpy())
                 target_token_results[key]['labels'].append(tr['correct'])
                 target_token_results[key]['preds'].append(tr['pred'])
                 target_token_results[key]['gt_chars'].append(tr['gt_char'])
+                target_token_results[key]['true_in_carry'].append(tr.get('true_in_carry', float('nan')))
+                target_token_results[key]['pred_in_carry'].append(tr.get('pred_in_carry', float('nan')))
         
         # 保存样本结果（仅在需要 pickle 导出时保留全量）
         if use_pickle and all_sample_results is not None:
