@@ -180,6 +180,7 @@ def load_baseline_metrics(
     val_ratio: float,
     test_ratio: float,
     seed: int,
+    compute_orig: bool = True,
 ) -> Tuple[Dict[str, float], Dict[str, np.ndarray]]:
     dataset_full = load_dataset(dataset_path)
     positions_data = load_positions(h5_path)
@@ -201,10 +202,16 @@ def load_baseline_metrics(
     pred_test = pred_digits[test_mask] if test_mask.any() else pred_digits
     sample_ids_test = sample_ids[test_mask] if test_mask.any() else sample_ids
 
-    token_acc, sample_acc = compute_token_sample_acc(pred_test, gt_test, sample_ids_test)
+    if compute_orig:
+        token_acc, sample_acc = compute_token_sample_acc(pred_test, gt_test, sample_ids_test)
+        orig_token_acc = float(token_acc)
+        orig_sample_acc = float(sample_acc)
+    else:
+        orig_token_acc = float("nan")
+        orig_sample_acc = float("nan")
     metrics = {
-        "orig_token_acc": float(token_acc),
-        "orig_sample_acc": float(sample_acc),
+        "orig_token_acc": orig_token_acc,
+        "orig_sample_acc": orig_sample_acc,
         "test_tokens": int(len(gt_test)),
         "test_samples": int(len(np.unique(sample_ids_test))),
     }
@@ -235,9 +242,9 @@ def main():
     parser.add_argument("--h5", type=Path, default=Path("VerticalFlow/results/plus_num3len10_Qwen3-4b/plus_num3len10_Qwen3-4b.h5"))
     parser.add_argument("--dataset", type=Path, default=Path("VerticalFlow/num3len10-10000.pkl"))
     parser.add_argument("--positions", type=int, nargs="*", default=None)
-    parser.add_argument("--train-ratio", type=float, default=0.6)
+    parser.add_argument("--train-ratio", type=float, default=0.8)
     parser.add_argument("--val-ratio", type=float, default=0.1)
-    parser.add_argument("--test-ratio", type=float, default=0.3)
+    parser.add_argument("--test-ratio", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--method", type=str, choices=["cot", "linear", "mlp", "steer", "force", "all"], default="all")
     parser.add_argument("--model", type=str, default="/data/Models/Qwen3-4b")
@@ -250,7 +257,10 @@ def main():
     parser.add_argument("--force-script", type=Path, default=Path("VerticalFlow/force_probe.py"))
     parser.add_argument("--linear-script", type=Path, default=Path("VerticalFlow/linear_probe.py"))
     parser.add_argument("--mlp-script", type=Path, default=Path("VerticalFlow/mlp_probe.py"))
+    parser.add_argument("--skip-orig", action="store_true", help="Skip original acc and SPI computations")
     args = parser.parse_args()
+
+    methods = [args.method] if args.method != "all" else ["cot", "linear", "mlp", "steer", "force"]
 
     base_metrics, arrays = load_baseline_metrics(
         args.h5,
@@ -260,34 +270,41 @@ def main():
         args.val_ratio,
         args.test_ratio,
         args.seed,
+        compute_orig=not args.skip_orig,
     )
-    if args.model is None:
-        raise ValueError("--model is required for online test mode")
-    dataset_full = load_dataset(args.dataset)
-    dataset_test = [dataset_full[i] for i in sorted(arrays["test_ids"]) if 0 <= i < len(dataset_full)]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
-    lm = AutoModelForCausalLM.from_pretrained(
-        args.model,
-        device_map=device,
-        torch_dtype="auto",
-        output_hidden_states=True,
-    )
-    base_token_acc, base_sample_acc = online_baseline_eval(
-        dataset_test,
-        tokenizer,
-        lm,
-        args.max_new_tokens,
-        device,
-    )
-    base_metrics["orig_token_acc"] = float(base_token_acc)
-    base_metrics["orig_sample_acc"] = float(base_sample_acc)
-    print("=== Baseline (original model, online) ===")
-    print(f"token_acc: {base_metrics['orig_token_acc']:.4f}")
-    print(f"sample_acc: {base_metrics['orig_sample_acc']:.4f}")
+    dataset_test = None
+    tokenizer = None
+    lm = None
+    need_local_model = (not args.skip_orig) or ("cot" in methods)
+    if need_local_model:
+        if args.model is None:
+            raise ValueError("--model is required for online test mode")
+        dataset_full = load_dataset(args.dataset)
+        dataset_test = [dataset_full[i] for i in sorted(arrays["test_ids"]) if 0 <= i < len(dataset_full)]
+        tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
+        lm = AutoModelForCausalLM.from_pretrained(
+            args.model,
+            device_map=device,
+            torch_dtype="auto",
+            output_hidden_states=True,
+        )
+
+    if not args.skip_orig:
+        base_token_acc, base_sample_acc = online_baseline_eval(
+            dataset_test,
+            tokenizer,
+            lm,
+            args.max_new_tokens,
+            device,
+        )
+        base_metrics["orig_token_acc"] = float(base_token_acc)
+        base_metrics["orig_sample_acc"] = float(base_sample_acc)
+        print("=== Baseline (original model, online) ===")
+        print(f"token_acc: {base_metrics['orig_token_acc']:.4f}")
+        print(f"sample_acc: {base_metrics['orig_sample_acc']:.4f}")
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    methods = [args.method] if args.method != "all" else ["cot", "linear", "mlp", "steer", "force"]
 
     for method in methods:
         print("\n" + "=" * 60)
@@ -431,19 +448,23 @@ def main():
 
         corrected_token = float(corrected_metrics["corrected_token_acc"])
         corrected_sample = float(corrected_metrics["corrected_sample_acc"])
-        improved_token = corrected_token - base_metrics["orig_token_acc"]
-        improved_sample = corrected_sample - base_metrics["orig_sample_acc"]
-        token_spi = compute_spi(corrected_token, base_metrics["orig_token_acc"])
-        sample_spi = compute_spi(corrected_sample, base_metrics["orig_sample_acc"])
+        if args.skip_orig:
+            print(f"corrected_token_acc: {corrected_token:.4f}")
+            print(f"corrected_sample_acc: {corrected_sample:.4f}")
+        else:
+            improved_token = corrected_token - base_metrics["orig_token_acc"]
+            improved_sample = corrected_sample - base_metrics["orig_sample_acc"]
+            token_spi = compute_spi(corrected_token, base_metrics["orig_token_acc"])
+            sample_spi = compute_spi(corrected_sample, base_metrics["orig_sample_acc"])
 
-        print(f"orig_token_acc: {base_metrics['orig_token_acc']:.4f}")
-        print(f"orig_sample_acc: {base_metrics['orig_sample_acc']:.4f}")
-        print(f"corrected_token_acc: {corrected_token:.4f}")
-        print(f"corrected_sample_acc: {corrected_sample:.4f}")
-        print(f"improved_token_acc: {improved_token:.4f}")
-        print(f"improved_sample_acc: {improved_sample:.4f}")
-        print(f"token_spi: {token_spi:.4f}")
-        print(f"sample_spi: {sample_spi:.4f}")
+            print(f"orig_token_acc: {base_metrics['orig_token_acc']:.4f}")
+            print(f"orig_sample_acc: {base_metrics['orig_sample_acc']:.4f}")
+            print(f"corrected_token_acc: {corrected_token:.4f}")
+            print(f"corrected_sample_acc: {corrected_sample:.4f}")
+            print(f"improved_token_acc: {improved_token:.4f}")
+            print(f"improved_sample_acc: {improved_sample:.4f}")
+            print(f"token_spi: {token_spi:.4f}")
+            print(f"sample_spi: {sample_spi:.4f}")
 
 
 if __name__ == "__main__":

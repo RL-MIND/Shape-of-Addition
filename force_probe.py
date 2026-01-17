@@ -453,7 +453,7 @@ def main():
         default="correct",
         help="Filter tokens by model correctness: all/correct/incorrect",
     )
-    parser.add_argument("--inertia-delta", type=float, default=0, help="Delta window around phi for intervention gating")
+    parser.add_argument("--inertia-delta", type=float, default=0.1, help="Delta window around phi for intervention gating")
     parser.add_argument("--output", type=Path, default=None, help="Optional path to write metrics JSON")
     parser.add_argument("--test-mode", type=str, choices=["online", "offline"], default="online")
     parser.add_argument("--model", type=str, default="/data/Models/Qwen3-4b")
@@ -485,19 +485,6 @@ def main():
         positions_filter=args.positions,
     )
 
-    if args.sample_filter != "all":
-        if args.sample_filter == "correct":
-            keep_mask = pred_digits == gt_digits
-        else:
-            keep_mask = pred_digits != gt_digits
-        flows_all = flows_all[keep_mask]
-        raw_labels = raw_labels[keep_mask]
-        carry_labels = carry_labels[keep_mask]
-        gt_digits = gt_digits[keep_mask]
-        pred_digits = pred_digits[keep_mask]
-        sample_ids = sample_ids[keep_mask]
-        pos_ids = pos_ids[keep_mask]
-
     train_ids, val_ids, test_ids = split_sample_ids(
         sample_ids,
         train_ratio=args.train_ratio,
@@ -509,6 +496,14 @@ def main():
     train_mask = np.isin(sample_ids, list(train_ids))
     val_mask = np.isin(sample_ids, list(val_ids)) if val_ids else np.zeros_like(sample_ids, dtype=bool)
     test_mask = np.isin(sample_ids, list(test_ids)) if test_ids else np.zeros_like(sample_ids, dtype=bool)
+
+    if args.sample_filter != "all":
+        if args.sample_filter == "correct":
+            keep_mask = pred_digits == gt_digits
+        else:
+            keep_mask = pred_digits != gt_digits
+        train_mask = np.logical_and(train_mask, keep_mask)
+        val_mask = np.logical_and(val_mask, keep_mask)
 
     flows_train = flows_all[train_mask]
     raw_labels_train = raw_labels[train_mask]
@@ -545,31 +540,54 @@ def main():
         f"raw_classes={raw_classes} | train_samples={len(train_ids)} | val_samples={len(val_ids)} | test_samples={len(test_ids)}"
     )
 
-    # ---------- Raw probe (S_raw) ----------
-    if layer_pair[0] is not None:
-        raw_layer_best = layer_pair[0]
-        raw_vecs = flows_train[:, raw_layer_best, :]
-        raw_model, raw_val_acc = train_probe(
-            raw_vecs,
-            raw_labels_train,
-            flows_val[:, raw_layer_best, :],
-            raw_labels_val,
-            num_classes=raw_classes,
-            batch_size=args.batch_size,
-            lr=args.lr,
-            epochs=args.epochs,
-            patience=args.patience,
-            device=device,
-            probe_type=args.probe_type,
-        )
-    else:
-        raw_best = (-1.0, -1.0, None, None)  # val_acc, full_acc placeholder, layer, model
-        for l in range(num_layers):
-            raw_vecs = flows_train[:, l, :]
-            model_l, val_l = train_probe(
+    def _positions_tag(pos_list: List[int] | None) -> str:
+        if not pos_list:
+            return "all"
+        return "-".join(str(p) for p in pos_list)
+
+    raw_tag = "auto" if layer_pair[0] is None else str(layer_pair[0])
+    inertia_tag = "auto" if layer_pair[1] is None else str(layer_pair[1])
+    ckpt_name = (
+        f"force_probe_{args.h5.stem}_pos{_positions_tag(args.positions)}_"
+        f"raw{raw_tag}_in{inertia_tag}_ptype{args.probe_type}_"
+        f"sf{args.sample_filter}_seed{args.seed}_"
+        f"tr{args.train_ratio}_vr{args.val_ratio}_te{args.test_ratio}.pt"
+    )
+    save_dir = Path("VerticalFlow/saved_models")
+    save_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_path = save_dir / ckpt_name
+    use_ckpt = ckpt_path.exists()
+
+    raw_val_acc = float("nan")
+    carry_val_loss = float("nan")
+    carry_val_acc = float("nan")
+    raw_layer_best = None
+    inertia_layer_best = None
+    raw_model = None
+    carry_model = None
+
+    if use_ckpt:
+        ckpt = torch.load(ckpt_path, map_location=device)
+        raw_layer_best = int(ckpt["raw_layer"])
+        inertia_layer_best = int(ckpt["inertia_layer"])
+        raw_model = build_probe(args.probe_type, input_dim=sample_dim, num_classes=raw_classes).to(device)
+        raw_model.load_state_dict(ckpt["raw_state"])
+        carry_model = build_regressor(args.probe_type, input_dim=sample_dim).to(device)
+        carry_model.load_state_dict(ckpt["carry_state"])
+        raw_val_acc = float(ckpt.get("raw_val_acc", float("nan")))
+        carry_val_loss = float(ckpt.get("carry_val_mse", float("nan")))
+        carry_val_acc = float(ckpt.get("carry_val_acc_floor", float("nan")))
+        print(f"Loaded probes from {ckpt_path}")
+
+    if not use_ckpt:
+        # ---------- Raw probe (S_raw) ----------
+        if layer_pair[0] is not None:
+            raw_layer_best = layer_pair[0]
+            raw_vecs = flows_train[:, raw_layer_best, :]
+            raw_model, raw_val_acc = train_probe(
                 raw_vecs,
                 raw_labels_train,
-                flows_val[:, l, :],
+                flows_val[:, raw_layer_best, :],
                 raw_labels_val,
                 num_classes=raw_classes,
                 batch_size=args.batch_size,
@@ -579,40 +597,40 @@ def main():
                 device=device,
                 probe_type=args.probe_type,
             )
-            if val_l > raw_best[0]:
-                raw_best = (val_l, float("nan"), l, model_l)
-        raw_val_acc, _, raw_layer_best, raw_model = raw_best
-        raw_vecs = flows_train[:, raw_layer_best, :]
-    if raw_layer_best is None or raw_model is None:
-        raise RuntimeError("Failed to train raw probe; no layer selected")
-    raw_val_acc = float(raw_val_acc)
-    print(f"Raw-sum probe (layer={raw_layer_best}): val_acc={raw_val_acc:.4f}")
+        else:
+            raw_best = (-1.0, -1.0, None, None)  # val_acc, full_acc placeholder, layer, model
+            for l in range(num_layers):
+                raw_vecs = flows_train[:, l, :]
+                model_l, val_l = train_probe(
+                    raw_vecs,
+                    raw_labels_train,
+                    flows_val[:, l, :],
+                    raw_labels_val,
+                    num_classes=raw_classes,
+                    batch_size=args.batch_size,
+                    lr=args.lr,
+                    epochs=args.epochs,
+                    patience=args.patience,
+                    device=device,
+                    probe_type=args.probe_type,
+                )
+                if val_l > raw_best[0]:
+                    raw_best = (val_l, float("nan"), l, model_l)
+            raw_val_acc, _, raw_layer_best, raw_model = raw_best
+            raw_vecs = flows_train[:, raw_layer_best, :]
+        if raw_layer_best is None or raw_model is None:
+            raise RuntimeError("Failed to train raw probe; no layer selected")
+        raw_val_acc = float(raw_val_acc)
+        print(f"Raw-sum probe (layer={raw_layer_best}): val_acc={raw_val_acc:.4f}")
 
-    # ---------- Carry probe (inertia) regression ----------
-    if layer_pair[1] is not None:
-        inertia_layer_best = layer_pair[1]
-        inertia_vecs = flows_train[:, inertia_layer_best, :]
-        carry_model, carry_val_loss, _ = train_carry_regressor(
-            inertia_vecs,
-            carry_labels_train,
-            flows_val[:, inertia_layer_best, :],
-            carry_labels_val,
-            batch_size=args.batch_size,
-            lr=args.lr,
-            epochs=args.epochs,
-            patience=args.patience,
-            device=device,
-            probe_type=args.probe_type,
-        )
-        inertia_vecs = flows_train[:, inertia_layer_best, :]
-    else:
-        carry_best = (float("inf"), float("nan"), None, None, None)  # val_loss, full_loss placeholder, layer, model, vecs
-        for l in range(num_layers):
-            inertia_vecs_l = flows_train[:, l, :]
-            model_l, val_l, _ = train_carry_regressor(
-                inertia_vecs_l,
+        # ---------- Carry probe (inertia) regression ----------
+        if layer_pair[1] is not None:
+            inertia_layer_best = layer_pair[1]
+            inertia_vecs = flows_train[:, inertia_layer_best, :]
+            carry_model, carry_val_loss, _ = train_carry_regressor(
+                inertia_vecs,
                 carry_labels_train,
-                flows_val[:, l, :],
+                flows_val[:, inertia_layer_best, :],
                 carry_labels_val,
                 batch_size=args.batch_size,
                 lr=args.lr,
@@ -621,22 +639,61 @@ def main():
                 device=device,
                 probe_type=args.probe_type,
             )
-            if val_l < carry_best[0]:
-                carry_best = (val_l, float("nan"), l, model_l, inertia_vecs_l)
-        carry_val_loss, _, inertia_layer_best, carry_model, inertia_vecs = carry_best
-    if inertia_layer_best is None or carry_model is None:
-        raise RuntimeError("Failed to train carry probe; no layer selected")
-    carry_val_acc = evaluate_carry_accuracy_floor(
-        carry_model,
-        flows_val[:, inertia_layer_best, :],
-        carry_labels_val,
-        batch_size=args.batch_size,
-        device=device,
-    )
-    print(
-        f"Carry probe (layer={inertia_layer_best}): val_mse={carry_val_loss:.6f}, "
-        f"val_acc_floor={carry_val_acc:.4f}"
-    )
+            inertia_vecs = flows_train[:, inertia_layer_best, :]
+        else:
+            carry_best = (float("inf"), float("nan"), None, None, None)  # val_loss, full_loss placeholder, layer, model, vecs
+            for l in range(num_layers):
+                inertia_vecs_l = flows_train[:, l, :]
+                model_l, val_l, _ = train_carry_regressor(
+                    inertia_vecs_l,
+                    carry_labels_train,
+                    flows_val[:, l, :],
+                    carry_labels_val,
+                    batch_size=args.batch_size,
+                    lr=args.lr,
+                    epochs=args.epochs,
+                    patience=args.patience,
+                    device=device,
+                    probe_type=args.probe_type,
+                )
+                if val_l < carry_best[0]:
+                    carry_best = (val_l, float("nan"), l, model_l, inertia_vecs_l)
+            carry_val_loss, _, inertia_layer_best, carry_model, inertia_vecs = carry_best
+        if inertia_layer_best is None or carry_model is None:
+            raise RuntimeError("Failed to train carry probe; no layer selected")
+        carry_val_acc = evaluate_carry_accuracy_floor(
+            carry_model,
+            flows_val[:, inertia_layer_best, :],
+            carry_labels_val,
+            batch_size=args.batch_size,
+            device=device,
+        )
+        print(
+            f"Carry probe (layer={inertia_layer_best}): val_mse={carry_val_loss:.6f}, "
+            f"val_acc_floor={carry_val_acc:.4f}"
+        )
+
+        torch.save(
+            {
+                "raw_layer": int(raw_layer_best),
+                "inertia_layer": int(inertia_layer_best),
+                "raw_val_acc": float(raw_val_acc),
+                "carry_val_mse": float(carry_val_loss),
+                "carry_val_acc_floor": float(carry_val_acc),
+                "probe_type": args.probe_type,
+                "sample_dim": int(sample_dim),
+                "raw_state": raw_model.state_dict(),
+                "carry_state": carry_model.state_dict(),
+            },
+            ckpt_path,
+        )
+        print(f"Saved probes to {ckpt_path}")
+    else:
+        print(f"Raw-sum probe (layer={raw_layer_best}): val_acc={raw_val_acc:.4f}")
+        print(
+            f"Carry probe (layer={inertia_layer_best}): val_mse={carry_val_loss:.6f}, "
+            f"val_acc_floor={carry_val_acc:.4f}"
+        )
 
     if args.test_mode == "offline":
         metrics = evaluate_correction(
