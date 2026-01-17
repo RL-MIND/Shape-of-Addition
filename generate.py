@@ -42,7 +42,7 @@ MAX_NEW_TOKENS = 25
 # 开关：是否check所有tokens
 # True: 每个token都判断并存储
 # False: 只check到第一个错误的token，记录后就停止（但如果全对，还会check后面一位）
-CHECK_ALL_TOKENS = False
+CHECK_ALL_TOKENS = True
 
 # 每处理多少个样本保存一次结果
 SAVE_INTERVAL = 200
@@ -51,9 +51,9 @@ SAVE_INTERVAL = 200
 OUTPUT_BACKEND = "hdf5"  # 默认增量写 HDF5，兼容需要时可改为 'pickle'
 
 # 结果保存路径（按后端）
-suffix = "_all" if CHECK_ALL_TOKENS else ""
+suffix = "_paritial" if not CHECK_ALL_TOKENS else ""
 RESULTS_PATH_PKL = "VerticalFlow/results/" + SIGN + "_" + DATA_PATH.split("/")[-1].split(".")[0].split("-")[0] + "_" + MODEL_NAME.split("/")[-1] + suffix + ".pkl"
-RESULTS_PATH_H5 = "VerticalFlow/results/" + SIGN + "_" + DATA_PATH.split("/")[-1].split(".")[0].split("-")[0] + "_" + MODEL_NAME.split("/")[-1] + suffix + ".h5"
+RESULTS_PATH_H5 = "VerticalFlow/results/" + SIGN + "_" + DATA_PATH.split("/")[-1].split(".")[0].split("-")[0] + "_" + MODEL_NAME.split("/")[-1] + suffix +"/"+ SIGN + "_" + DATA_PATH.split("/")[-1].split(".")[0].split("-")[0] + "_" + MODEL_NAME.split("/")[-1] + suffix + ".h5"
 
 # 是否在使用 HDF5 时额外导出最终 pickle（可能占用大量内存/磁盘）
 ENABLE_FINAL_PICKLE_EXPORT = False
@@ -670,6 +670,10 @@ class HDF5IncrementalWriter:
                 if pos_data.get("pred_in_carry"):
                     pic_array = np.asarray(pos_data["pred_in_carry"], dtype=np.float32)
                     self._append_dataset(pos_group, "pred_in_carry", pic_array)
+                # 保存 sample_ids 以便离线按样本精确对齐
+                if pos_data.get("sample_ids"):
+                    ids_array = np.asarray(pos_data["sample_ids"], dtype=np.int32)
+                    self._append_dataset(pos_group, "sample_ids", ids_array)
 
     def append_sample_input_ids(self, sample_idx, input_ids):
         """将样本的 input_ids 存储到 HDF5 的 samples 组。"""
@@ -928,6 +932,7 @@ def main():
                         'is_extra': tr.get('is_extra', False),
                         'true_in_carry': [],
                         'pred_in_carry': [],
+                        'sample_ids': [],
                     }
                 target_token_results[key]['flows'].append(tr['flow'].numpy())
                 target_token_results[key]['labels'].append(tr['correct'])
@@ -935,6 +940,8 @@ def main():
                 target_token_results[key]['gt_chars'].append(tr['gt_char'])
                 target_token_results[key]['true_in_carry'].append(tr.get('true_in_carry', float('nan')))
                 target_token_results[key]['pred_in_carry'].append(tr.get('pred_in_carry', float('nan')))
+                # 记录样本索引，便于后续按 sample_id 对齐
+                target_token_results[key]['sample_ids'].append(data_idx)
         
         # 保存样本结果（仅在需要 pickle 导出时保留全量）
         if use_pickle and all_sample_results is not None:
@@ -944,10 +951,6 @@ def main():
                 "token_results": token_results,
                 "all_correct": all_correct,
             })
-        
-        # 保存当前样本的 input_ids（每个样本都保存）
-        if backend == "hdf5" and writer is not None:
-            writer.save_sample_input_ids(data_idx, input_ids)
         
         # 保存当前样本的 input_ids（每个样本都保存）
         if backend == "hdf5" and writer is not None:

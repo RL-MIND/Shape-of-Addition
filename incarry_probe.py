@@ -3,7 +3,7 @@ import copy
 import math
 import os
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -171,6 +171,87 @@ def load_carry_data(path: Path, include_extra: bool = False) -> Tuple[np.ndarray
     true_all = np.concatenate(true_carry_list, axis=0)
     pred_all = np.concatenate(pred_carry_list, axis=0)
     return flows_all, true_all, pred_all
+
+
+def load_carry_data_with_sample_ids(
+    path: Path, include_extra: bool = False
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]:
+    """Load flows, carries, and optional sample_ids if present in H5.
+
+    Returns (flows_all, true_all, pred_all, sample_ids_all or None).
+    """
+    if not path.exists():
+        raise FileNotFoundError(f"Data file not found: {path}")
+
+    flows_list: List[np.ndarray] = []
+    true_carry_list: List[np.ndarray] = []
+    pred_carry_list: List[np.ndarray] = []
+    sample_ids_list: List[np.ndarray] = []
+    all_have_ids = True
+
+    with h5py.File(path, "r") as hf:
+        positions_group = hf["all_token_results"]
+        numeric_positions, string_positions = _extract_positions(positions_group)
+        positions_to_load: List[str] = []
+
+        for pos in numeric_positions:
+            positions_to_load.append(f"pos_{pos}")
+        for pos in string_positions:
+            if pos == "extra" and not include_extra:
+                continue
+            positions_to_load.append(str(pos) if pos.startswith("pos_") else pos)
+
+        for pos_name in positions_to_load:
+            if pos_name not in positions_group:
+                continue
+            pos_group = positions_group[pos_name]
+            if "flows" not in pos_group:
+                continue
+            flows = pos_group["flows"][:].astype(np.float32)
+            true_carry = pos_group.get("true_in_carry")
+            pred_carry = pos_group.get("pred_in_carry")
+            sample_ids_ds = pos_group.get("sample_ids")
+            if true_carry is None or pred_carry is None:
+                continue
+            true_carry = np.asarray(true_carry[:], dtype=np.float32)
+            pred_carry = np.asarray(pred_carry[:], dtype=np.float32)
+            if not (len(flows) == len(true_carry) == len(pred_carry)):
+                print(f"Skip position {pos_name}: mismatched lengths")
+                all_have_ids = False
+                continue
+            sample_ids_pos: Optional[np.ndarray] = None
+            if sample_ids_ds is not None:
+                sample_ids_pos = np.asarray(sample_ids_ds[:], dtype=np.int64)
+                if sample_ids_pos is not None and len(sample_ids_pos) != len(flows):
+                    print(f"Skip sample_ids for {pos_name}: length mismatch")
+                    sample_ids_pos = None
+            else:
+                all_have_ids = False
+
+            flows_list.append(flows)
+            true_carry_list.append(true_carry)
+            pred_carry_list.append(pred_carry)
+            if sample_ids_pos is not None:
+                sample_ids_list.append(sample_ids_pos)
+            else:
+                all_have_ids = False
+            print(
+                f"  Loaded {pos_name}: {len(flows)} samples, flow shape {flows.shape[1:]}, "
+                f"sample_ids={'yes' if sample_ids_pos is not None else 'no'}"
+            )
+
+    if not flows_list:
+        raise RuntimeError("No usable data loaded. Check that true_in_carry and pred_in_carry exist.")
+
+    flows_all = np.concatenate(flows_list, axis=0)
+    true_all = np.concatenate(true_carry_list, axis=0)
+    pred_all = np.concatenate(pred_carry_list, axis=0)
+    sample_ids_all: Optional[np.ndarray]
+    if all_have_ids and sample_ids_list:
+        sample_ids_all = np.concatenate(sample_ids_list, axis=0)
+    else:
+        sample_ids_all = None
+    return flows_all, true_all, pred_all, sample_ids_all
 
 
 # ----------------------------
