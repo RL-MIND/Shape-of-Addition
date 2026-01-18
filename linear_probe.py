@@ -148,8 +148,13 @@ def online_eval(
         idx = torch.argmax(digit_logits, dim=1).item()
         return digit_val_list[idx]
 
-    W = probe.weight.detach().to(device)
-    b = probe.bias.detach().to(device) if probe.bias is not None else torch.zeros(W.shape[0], device=device)
+    model_dtype = model.dtype if hasattr(model, "dtype") else torch.float32
+    W = probe.weight.detach().to(device=device, dtype=model_dtype)
+    b = (
+        probe.bias.detach().to(device=device, dtype=model_dtype)
+        if probe.bias is not None
+        else torch.zeros(W.shape[0], device=device, dtype=model_dtype)
+    )
 
     token_total = 0
     token_correct = 0
@@ -189,7 +194,7 @@ def online_eval(
                 logits = outputs.logits[:, -1, :]
                 d_pred = select_digit(logits)
                 hidden_states = outputs.hidden_states
-                h = hidden_states[layer_idx + 1][:, -1, :]
+                h = hidden_states[layer_idx + 1][:, -1, :].to(W.dtype)
 
                 if mode == "direct":
                     logits_probe = h @ W.t() + b
@@ -250,7 +255,7 @@ def main():
     parser.add_argument("--layer-end", type=int, default=None)
     parser.add_argument("--mode", type=str, choices=["direct", "steer"], default="direct")
     parser.add_argument("--lambda-grid", type=str, default="0.0,0.25,0.5,0.75,1.0")
-    parser.add_argument("--test-mode", type=str, choices=["online", "offline"], default="online")
+    parser.add_argument("--test-mode", type=str, choices=["online", "offline"], default="offline")
     parser.add_argument("--model", type=str, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=25)
     parser.add_argument("--output", type=Path, required=True)

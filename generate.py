@@ -54,7 +54,7 @@ OUTPUT_BACKEND = "hdf5"  # 默认增量写 HDF5，兼容需要时可改为 'pick
 suffix = "_paritial" if not CHECK_ALL_TOKENS else ""
 RESULTS_PATH_PKL = "VerticalFlow/results/" + SIGN + "_" + DATA_PATH.split("/")[-1].split(".")[0].split("-")[0] + "_" + MODEL_NAME.split("/")[-1] + suffix + ".pkl"
 RESULTS_PATH_H5 = "VerticalFlow/results/" + SIGN + "_" + DATA_PATH.split("/")[-1].split(".")[0].split("-")[0] + "_" + MODEL_NAME.split("/")[-1] + suffix +"/"+ SIGN + "_" + DATA_PATH.split("/")[-1].split(".")[0].split("-")[0] + "_" + MODEL_NAME.split("/")[-1] + suffix + ".h5"
-
+RESULTS_PATH_H5 = "VerticalFlow/results/" + SIGN + "_" + DATA_PATH.split("/")[-1].split(".")[0].split("-")[0] + "_" + MODEL_NAME.split("/")[-1] + suffix + ".h5"
 # 是否在使用 HDF5 时额外导出最终 pickle（可能占用大量内存/磁盘）
 ENABLE_FINAL_PICKLE_EXPORT = False
 
@@ -844,7 +844,7 @@ def main():
         gt_value = op_func(operands)
         
         # 构建输入
-        prompt = f"Calculate {expr}. Only output a number."
+        prompt = f"Calculate {expr}. Think step by step internally, but do not show your reasoning. Only output a number."
         messages = [{"role": "user", "content": prompt}]
         text = tokenizer.apply_chat_template(
             messages,

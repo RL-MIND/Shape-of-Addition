@@ -241,6 +241,8 @@ def evaluate_correction(
     inertia_delta: float,
     device: torch.device,
 ) -> Dict[str, object]:
+    raw_model.eval()
+    carry_model.eval()
     with torch.no_grad():
         X_raw = torch.tensor(flows[:, raw_layer, :], dtype=torch.float32, device=device)
         X_inertia = torch.tensor(flows[:, inertia_layer, :], dtype=torch.float32, device=device)
@@ -386,6 +388,12 @@ def online_force_eval(
                 hidden_states = outputs.hidden_states
                 raw_h = hidden_states[raw_layer_idx + 1][:, -1, :]
                 inertia_h = hidden_states[inertia_layer_idx + 1][:, -1, :]
+                raw_dtype = next(raw_model.parameters()).dtype
+                carry_dtype = next(carry_model.parameters()).dtype
+                if raw_h.dtype != raw_dtype:
+                    raw_h = raw_h.to(dtype=raw_dtype)
+                if inertia_h.dtype != carry_dtype:
+                    inertia_h = inertia_h.to(dtype=carry_dtype)
                 raw_hat = int(torch.argmax(raw_model(raw_h), dim=1).item())
                 carry_pred_val = float(carry_model(inertia_h).squeeze(1).item())
                 intervene = should_intervene(raw_hat, carry_pred_val, d_pred)
@@ -450,7 +458,7 @@ def main():
         "--sample-filter",
         type=str,
         choices=["all", "correct", "incorrect"],
-        default="correct",
+        default="all",
         help="Filter tokens by model correctness: all/correct/incorrect",
     )
     parser.add_argument("--inertia-delta", type=float, default=0.1, help="Delta window around phi for intervention gating")

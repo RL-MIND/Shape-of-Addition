@@ -185,6 +185,9 @@ def online_eval(
                 _ = select_digit(logits)
                 hidden_states = outputs.hidden_states
                 h = hidden_states[layer_idx + 1][:, -1, :]
+                probe_dtype = next(probe.parameters()).dtype
+                if h.dtype != probe_dtype:
+                    h = h.to(dtype=probe_dtype)
                 logits_probe = probe(h)
                 corrected_digit = int(torch.argmax(logits_probe, dim=1).item())
 
@@ -234,7 +237,7 @@ def main():
     parser.add_argument("--layers", type=int, nargs="*", default=None)
     parser.add_argument("--layer-start", type=int, default=None)
     parser.add_argument("--layer-end", type=int, default=None)
-    parser.add_argument("--test-mode", type=str, choices=["online", "offline"], default="online")
+    parser.add_argument("--test-mode", type=str, choices=["online", "offline"], default="offline")
     parser.add_argument("--model", type=str, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=25)
     parser.add_argument("--output", type=Path, required=True)

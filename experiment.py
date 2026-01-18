@@ -130,31 +130,29 @@ def cot_eval(
 
             expr = " + ".join(str(x) for x in operands)
             prompt = (
-                f"Calculate {expr}. Think step by step internally, then output only the final number." 
-                f"Answer:" 
+                f"Calculate {expr}. Think step by step internally, but do not show your reasoning. Only output a number."
             )
             messages = [{"role": "user", "content": prompt}]
             text = tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
             )
+            # 与 generate.py 保持一致，追加表达式与等号以对齐答案段
+            text = text + expr + " = "
+
             inputs = tokenizer([text], return_tensors="pt").to(device)
             input_len = inputs["input_ids"].shape[1]
-            outputs = model.generate(
+            generate_outputs = model.generate(
                 **inputs,
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
+                return_dict_in_generate=True,
+                output_hidden_states=True,
             )
-            generated_tokens = outputs[0][input_len:]
-            decoded = tokenizer.decode(generated_tokens, skip_special_tokens=True)
-            decoded_lower = decoded
-            answer_idx = decoded_lower.rfind("answer:")
-            if answer_idx != -1:
-                answer_text = decoded[answer_idx + len("answer:"):]
-                matches = re.findall(r"\d+", answer_text)
-                pred_str = matches[0] if matches else ""
-            else:
-                matches = re.findall(r"\d+", decoded)
-                pred_str = matches[-1] if matches else ""
+            generated_tokens = generate_outputs.sequences[0][input_len:]
+            decoded = tokenizer.decode(generated_tokens, skip_special_tokens=False)
+            # 简化逻辑：仅提取最后出现的数字串作为答案
+            matches = re.findall(r"\d+", decoded)
+            pred_str = matches[-1] if matches else ""
 
             sample_total += 1
             if pred_str == gt_str:
