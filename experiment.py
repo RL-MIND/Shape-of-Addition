@@ -3,6 +3,7 @@ import json
 import re
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -117,21 +118,22 @@ def cot_eval(
     max_new_tokens: int,
     device: torch.device,
 ) -> Tuple[float, float]:
+    log_dir = Path("VerticalFlow/log/log_cot")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"log_cot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl"
     token_total = 0
     token_correct = 0
     sample_total = 0
     sample_correct = 0
 
     model.eval()
-    with torch.no_grad():
+    with torch.no_grad(), log_path.open("w", encoding="utf-8") as log_f:
         for operands in dataset:
             gt_val = sum(operands)
             gt_str = str(gt_val)
 
             expr = " + ".join(str(x) for x in operands)
-            prompt = (
-                f"Calculate {expr}. Think step by step internally, but do not show your reasoning. Only output a number."
-            )
+            prompt = f"Calculate {expr}. Think step by step internally, but do not show your reasoning. Only output a number."
             messages = [{"role": "user", "content": prompt}]
             text = tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
@@ -154,15 +156,26 @@ def cot_eval(
             matches = re.findall(r"\d+", decoded)
             pred_str = matches[-1] if matches else ""
 
+            log_record = {
+                "expr": expr,
+                "prompt": prompt,
+                "generated": decoded,
+                "pred": pred_str,
+                "gt": gt_str,
+                "correct": pred_str == gt_str,
+            }
+            log_f.write(json.dumps(log_record, ensure_ascii=False) + "\n")
+
             sample_total += 1
             if pred_str == gt_str:
                 sample_correct += 1
 
             g_len = len(pred_str)
             t_len = len(gt_str)
-            for i in range(max(g_len, t_len)):
+            # 与 online_baseline_eval 对齐：仅统计到 gt 长度，避免额外位惩罚
+            for i in range(t_len):
                 token_total += 1
-                if i < t_len and i < g_len and pred_str[i] == gt_str[i]:
+                if i < g_len and pred_str[i] == gt_str[i]:
                     token_correct += 1
 
     token_acc = token_correct / token_total if token_total else 0.0
@@ -279,7 +292,12 @@ def main():
         if args.model is None:
             raise ValueError("--model is required for online test mode")
         dataset_full = load_dataset(args.dataset)
-        dataset_test = [dataset_full[i] for i in sorted(arrays["test_ids"]) if 0 <= i < len(dataset_full)]
+        # 保护：若 test_ids 为空，则退化为使用全数据（避免空测试集影响评估）
+        test_ids = arrays.get("test_ids")
+        if test_ids:
+            dataset_test = [dataset_full[i] for i in sorted(test_ids) if 0 <= i < len(dataset_full)]
+        else:
+            dataset_test = dataset_full
         tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
         lm = AutoModelForCausalLM.from_pretrained(
             args.model,

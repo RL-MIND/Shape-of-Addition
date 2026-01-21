@@ -18,6 +18,12 @@ from probe_data import (
     load_positions,
     split_sample_ids,
 )
+from verify import (
+    build_dirs_cross_digit,
+    collect_records,
+    compute_means,
+    load_position_arrays,
+)
 
 
 # ===========================
@@ -300,6 +306,130 @@ def evaluate_correction(
     }
 
 
+def evaluate_correction_vector_steer(
+    raw_model: nn.Module,
+    carry_model: nn.Module,
+    flows: np.ndarray,
+    raw_layer: int,
+    inertia_layer: int,
+    gt_digits: np.ndarray,
+    pred_digits: np.ndarray,
+    sample_ids: np.ndarray,
+    inertia_delta: float,
+    digit_id_list: List[int],
+    digit_val_list: List[int],
+    lm_head: nn.Module,
+    dir01: Dict[int, torch.Tensor],
+    dir12: Dict[int, torch.Tensor],
+    device: torch.device,
+) -> Dict[str, object]:
+    raw_model.eval()
+    carry_model.eval()
+    lm_head.eval()
+    with torch.no_grad():
+        X_raw = torch.tensor(flows[:, raw_layer, :], dtype=torch.float32, device=device)
+        X_inertia = torch.tensor(flows[:, inertia_layer, :], dtype=torch.float32, device=device)
+        raw_dtype = next(raw_model.parameters()).dtype
+        carry_dtype = next(carry_model.parameters()).dtype
+        if X_raw.dtype != raw_dtype:
+            X_raw = X_raw.to(dtype=raw_dtype)
+        if X_inertia.dtype != carry_dtype:
+            X_inertia = X_inertia.to(dtype=carry_dtype)
+        raw_hat = torch.argmax(raw_model(X_raw), dim=1).cpu().numpy()
+        carry_pred = carry_model(X_inertia).squeeze(1).cpu().numpy()
+
+    corrected = np.zeros_like(raw_hat, dtype=np.int64)
+    head_dtype = next(lm_head.parameters()).dtype
+    h_last_all = torch.tensor(flows[:, -1, :], dtype=head_dtype, device=device)
+
+    for i in range(len(raw_hat)):
+        raw_d = int(raw_hat[i])
+        phi = float(max(carry_pred[i], 0.0))
+        d_pred = int(pred_digits[i]) if 0 <= pred_digits[i] <= 9 else -1
+
+        low = math.floor(phi - inertia_delta)
+        high = math.floor(phi + inertia_delta)
+        intervene = True
+        if d_pred != -1:
+            for c in range(low, high + 1):
+                if (raw_d + c) % 10 == d_pred:
+                    intervene = False
+                    break
+
+        if not intervene:
+            corrected[i] = d_pred
+            continue
+
+        pred_carry = int((d_pred - raw_d) % 10) if d_pred != -1 else -1
+        actual_carry = int(math.floor(phi))
+        chosen_digit = None
+        if pred_carry in (0, 1, 2) and actual_carry in (0, 1, 2):
+            diff = actual_carry - pred_carry
+            steer_vecs: List[torch.Tensor] = []
+            if diff == 1:
+                if pred_carry == 0 and dir01.get(d_pred) is not None:
+                    steer_vecs.append(dir01[d_pred])
+                elif pred_carry == 1 and dir12.get(d_pred) is not None:
+                    steer_vecs.append(dir12[d_pred])
+            elif diff == -1:
+                if pred_carry == 1 and dir01.get((d_pred - 1) % 10) is not None:
+                    steer_vecs.append(dir01[(d_pred - 1) % 10])
+                elif pred_carry == 2 and dir12.get((d_pred - 1) % 10) is not None:
+                    steer_vecs.append(dir12[(d_pred - 1) % 10])
+            elif diff == 2:
+                if pred_carry == 0:
+                    v1 = dir01.get(d_pred)
+                    v2 = dir12.get((d_pred + 1) % 10)
+                    if v1 is not None and v2 is not None:
+                        steer_vecs.extend([v1, v2])
+            elif diff == -2:
+                if pred_carry == 2:
+                    v1 = dir12.get((d_pred - 1) % 10)
+                    v2 = dir01.get((d_pred - 2) % 10)
+                    if v1 is not None and v2 is not None:
+                        steer_vecs.extend([v1, v2])
+
+            if steer_vecs:
+                steer_sum = torch.zeros_like(h_last_all[i:i + 1])
+                for vec in steer_vecs:
+                    steer_sum = steer_sum + vec
+                steered = h_last_all[i:i + 1] + steer_sum
+                steered_logits = lm_head(steered)
+                digit_logits = steered_logits[:, digit_id_list]
+                idx = torch.argmax(digit_logits, dim=1).item()
+                chosen_digit = int(digit_val_list[idx])
+
+        if chosen_digit is None:
+            carry_hat = math.floor(phi)
+            chosen_digit = int((raw_d + carry_hat) % 10)
+
+        corrected[i] = chosen_digit
+
+    orig_token_acc = float(np.mean(pred_digits == gt_digits))
+    corrected_token_acc = float(np.mean(corrected == gt_digits))
+
+    unique_samples = np.unique(sample_ids)
+    orig_sample_correct = 0
+    corrected_sample_correct = 0
+    for sid in unique_samples:
+        mask = sample_ids == sid
+        if np.all(pred_digits[mask] == gt_digits[mask]):
+            orig_sample_correct += 1
+        if np.all(corrected[mask] == gt_digits[mask]):
+            corrected_sample_correct += 1
+    sample_acc_orig = orig_sample_correct / len(unique_samples) if len(unique_samples) else 0.0
+    sample_acc_corrected = corrected_sample_correct / len(unique_samples) if len(unique_samples) else 0.0
+
+    return {
+        "total": float(len(gt_digits)),
+        "orig_token_acc": orig_token_acc,
+        "corrected_token_acc": corrected_token_acc,
+        "orig_sample_acc": sample_acc_orig,
+        "corrected_sample_acc": sample_acc_corrected,
+        "corrected_digits": corrected,
+    }
+
+
 def get_digit_token_ids(tokenizer: AutoTokenizer) -> Tuple[List[int], List[int]]:
     digit_ids = {}
     for d in range(10):
@@ -323,6 +453,9 @@ def online_force_eval(
     max_new_tokens: int,
     inertia_delta: float,
     device: torch.device,
+    vector_steer: bool = False,
+    dir01: Dict[int, torch.Tensor] | None = None,
+    dir12: Dict[int, torch.Tensor] | None = None,
 ) -> Tuple[float, float]:
     digit_id_list, digit_val_list = get_digit_token_ids(tokenizer)
 
@@ -346,6 +479,16 @@ def online_force_eval(
     token_correct = 0
     sample_total = 0
     sample_correct = 0
+
+    lm_head = None
+    if vector_steer:
+        lm_head = getattr(model, "lm_head", None)
+        if lm_head is None:
+            lm_head = model.get_output_embeddings()
+        if lm_head is None:
+            raise RuntimeError("vector-steer requires lm_head or output embeddings")
+        lm_head = lm_head.to(device)
+        lm_head.eval()
 
     raw_model.eval()
     carry_model.eval()
@@ -397,7 +540,55 @@ def online_force_eval(
                 raw_hat = int(torch.argmax(raw_model(raw_h), dim=1).item())
                 carry_pred_val = float(carry_model(inertia_h).squeeze(1).item())
                 intervene = should_intervene(raw_hat, carry_pred_val, d_pred)
-                if intervene:
+                if intervene and vector_steer and dir01 is not None and dir12 is not None and lm_head is not None:
+                    pred_carry = int((d_pred - raw_hat) % 10)
+                    actual_carry = int(math.floor(max(carry_pred_val, 0.0)))
+                    if pred_carry in (0, 1, 2) and actual_carry in (0, 1, 2):
+                        diff = actual_carry - pred_carry
+                        steer_vecs: List[torch.Tensor] = []
+                        if diff == 1:
+                            if pred_carry == 0 and dir01.get(d_pred) is not None:
+                                steer_vecs.append(dir01[d_pred])
+                            elif pred_carry == 1 and dir12.get(d_pred) is not None:
+                                steer_vecs.append(dir12[d_pred])
+                        elif diff == -1:
+                            if pred_carry == 1 and dir01.get((d_pred - 1) % 10) is not None:
+                                steer_vecs.append(dir01[(d_pred - 1) % 10])
+                            elif pred_carry == 2 and dir12.get((d_pred - 1) % 10) is not None:
+                                steer_vecs.append(dir12[(d_pred - 1) % 10])
+                        elif diff == 2:
+                            if pred_carry == 0:
+                                v1 = dir01.get(d_pred)
+                                v2 = dir12.get((d_pred + 1) % 10)
+                                if v1 is not None and v2 is not None:
+                                    steer_vecs.extend([v1, v2])
+                        elif diff == -2:
+                            if pred_carry == 2:
+                                v1 = dir12.get((d_pred - 1) % 10)
+                                v2 = dir01.get((d_pred - 2) % 10)
+                                if v1 is not None and v2 is not None:
+                                    steer_vecs.extend([v1, v2])
+
+                        if steer_vecs:
+                            h_last = hidden_states[-1][:, -1, :]
+                            head_dtype = next(lm_head.parameters()).dtype
+                            if h_last.dtype != head_dtype:
+                                h_last = h_last.to(dtype=head_dtype)
+                            steer_sum = torch.zeros_like(h_last)
+                            for vec in steer_vecs:
+                                steer_sum = steer_sum + vec
+                            steered = h_last + steer_sum
+                            steered_logits = lm_head(steered)
+                            digit_logits = steered_logits[:, digit_id_list]
+                            idx = torch.argmax(digit_logits, dim=1).item()
+                            chosen_digit = int(digit_val_list[idx])
+                        else:
+                            carry_hat = math.floor(max(carry_pred_val, 0.0))
+                            chosen_digit = int((raw_hat + carry_hat) % 10)
+                    else:
+                        carry_hat = math.floor(max(carry_pred_val, 0.0))
+                        chosen_digit = int((raw_hat + carry_hat) % 10)
+                elif intervene:
                     carry_hat = math.floor(max(carry_pred_val, 0.0))
                     chosen_digit = int((raw_hat + carry_hat) % 10)
                 else:
@@ -462,6 +653,7 @@ def main():
         help="Filter tokens by model correctness: all/correct/incorrect",
     )
     parser.add_argument("--inertia-delta", type=float, default=0.1, help="Delta window around phi for intervention gating")
+    parser.add_argument("--vector-steer", action="store_true", help="Use vector steering instead of raw_sum+incarry correction")
     parser.add_argument("--output", type=Path, default=None, help="Optional path to write metrics JSON")
     parser.add_argument("--test-mode", type=str, choices=["online", "offline"], default="online")
     parser.add_argument("--model", type=str, default="/data/Models/Qwen3-4b")
@@ -704,19 +896,66 @@ def main():
         )
 
     if args.test_mode == "offline":
-        metrics = evaluate_correction(
-            raw_model,
-            carry_model,
-            flows_test,
-            raw_layer_best,
-            inertia_layer_best,
-            gt_digits_test,
-            pred_digits_test,
-            sample_ids_test,
-            pos_ids_test,
-            args.inertia_delta,
-            device,
-        )
+        if args.vector_steer:
+            if args.model is None:
+                raise ValueError("--model is required for offline vector-steer mode")
+            tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
+            lm = AutoModelForCausalLM.from_pretrained(
+                args.model,
+                device_map=device,
+                torch_dtype="auto",
+                output_hidden_states=True,
+            )
+            labels_by_pos, gt_by_pos, true_carry_by_pos, last_layer_by_pos = load_position_arrays(args.h5)
+            pos_filter = set(args.positions) if args.positions else None
+            records = collect_records(labels_by_pos, gt_by_pos, true_carry_by_pos, last_layer_by_pos, positions=pos_filter)
+            means, _ = compute_means(records)
+            dir01_np, dir12_np = build_dirs_cross_digit(means)
+            head = getattr(lm, "lm_head", None)
+            if head is None:
+                head = lm.get_output_embeddings()
+            if head is None:
+                raise RuntimeError("vector-steer requires lm_head or output embeddings")
+            head_dtype = next(head.parameters()).dtype
+            dir01 = {}
+            dir12 = {}
+            for d in range(10):
+                if dir01_np.get(d) is not None:
+                    dir01[d] = torch.tensor(dir01_np[d], dtype=head_dtype, device=device).unsqueeze(0)
+                if dir12_np.get(d) is not None:
+                    dir12[d] = torch.tensor(dir12_np[d], dtype=head_dtype, device=device).unsqueeze(0)
+            digit_id_list, digit_val_list = get_digit_token_ids(tokenizer)
+            metrics = evaluate_correction_vector_steer(
+                raw_model,
+                carry_model,
+                flows_test,
+                raw_layer_best,
+                inertia_layer_best,
+                gt_digits_test,
+                pred_digits_test,
+                sample_ids_test,
+                args.inertia_delta,
+                digit_id_list,
+                digit_val_list,
+                head,
+                dir01,
+                dir12,
+                device,
+            )
+        else:
+            metrics = evaluate_correction(
+                raw_model,
+                carry_model,
+                flows_test,
+                raw_layer_best,
+                inertia_layer_best,
+                gt_digits_test,
+                pred_digits_test,
+                sample_ids_test,
+                pos_ids_test,
+                args.inertia_delta,
+                device,
+            )
         corrected_token_acc = float(metrics["corrected_token_acc"])
         corrected_sample_acc = float(metrics["corrected_sample_acc"])
     else:
@@ -729,6 +968,27 @@ def main():
             torch_dtype="auto",
             output_hidden_states=True,
         )
+        dir01 = None
+        dir12 = None
+        if args.vector_steer:
+            labels_by_pos, gt_by_pos, true_carry_by_pos, last_layer_by_pos = load_position_arrays(args.h5)
+            pos_filter = set(args.positions) if args.positions else None
+            records = collect_records(labels_by_pos, gt_by_pos, true_carry_by_pos, last_layer_by_pos, positions=pos_filter)
+            means, _ = compute_means(records)
+            dir01_np, dir12_np = build_dirs_cross_digit(means)
+            head = getattr(lm, "lm_head", None)
+            if head is None:
+                head = lm.get_output_embeddings()
+            if head is None:
+                raise RuntimeError("vector-steer requires lm_head or output embeddings")
+            head_dtype = next(head.parameters()).dtype
+            dir01 = {}
+            dir12 = {}
+            for d in range(10):
+                if dir01_np.get(d) is not None:
+                    dir01[d] = torch.tensor(dir01_np[d], dtype=head_dtype, device=device).unsqueeze(0)
+                if dir12_np.get(d) is not None:
+                    dir12[d] = torch.tensor(dir12_np[d], dtype=head_dtype, device=device).unsqueeze(0)
         dataset_test = [dataset_full[i] for i in sorted(test_ids) if 0 <= i < len(dataset_full)]
         corrected_token_acc, corrected_sample_acc = online_force_eval(
             dataset_test,
@@ -741,6 +1001,9 @@ def main():
             args.max_new_tokens,
             args.inertia_delta,
             device,
+            vector_steer=args.vector_steer,
+            dir01=dir01,
+            dir12=dir12,
         )
 
     print("\n=== Force probe (test) ===")
