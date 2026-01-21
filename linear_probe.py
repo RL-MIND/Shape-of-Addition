@@ -18,6 +18,26 @@ from probe_data import (
 )
 
 
+def mask_first_error_positions(
+    pred_digits: np.ndarray,
+    gt_digits: np.ndarray,
+    sample_ids: np.ndarray,
+    pos_ids: np.ndarray,
+) -> np.ndarray:
+    """仅保留每个样本的第一个错误位置（其余错误位置置为 False）。"""
+    keep = np.ones_like(pred_digits, dtype=bool)
+    incorrect = pred_digits != gt_digits
+    if not np.any(incorrect):
+        return keep
+    for sid in np.unique(sample_ids[incorrect]):
+        sid_mask = (sample_ids == sid) & incorrect
+        if np.sum(sid_mask) <= 1:
+            continue
+        min_pos = pos_ids[sid_mask].min()
+        keep[sid_mask & (pos_ids != min_pos)] = False
+    return keep
+
+
 def train_linear_probe(
     X_train: np.ndarray,
     y_train: np.ndarray,
@@ -118,6 +138,53 @@ def parse_layer_candidates(num_layers: int, layers: List[int] | None, layer_star
     return list(range(start, end + 1))
 
 
+def compute_correction_metrics(
+    corrected: np.ndarray,
+    pred_orig: np.ndarray,
+    gt: np.ndarray,
+) -> Tuple[float, float, float]:
+    """
+    计算校正统计指标。
+    
+    Args:
+        corrected: 探针校正后的预测
+        pred_orig: 原始模型预测
+        gt: ground truth
+    
+    Returns:
+        modified_rate: 被修改的token比例
+        tp_correction: 原始错误中被成功修正的比例
+        fp_preservation: 原始正确中保持不变的比例
+    """
+    n = len(corrected)
+    if n == 0:
+        return 0.0, 0.0, 0.0
+    
+    # Modified Rate: 探针输出与原始模型输出不同的比例
+    modified_count = np.sum(corrected != pred_orig)
+    modified_rate = float(modified_count) / n
+    
+    # TP Correction: 原始错误中被成功修正的比例
+    orig_errors = pred_orig != gt
+    tp_total = np.sum(orig_errors)
+    if tp_total > 0:
+        tp_corrected = np.sum((orig_errors) & (corrected == gt))
+        tp_correction = float(tp_corrected) / float(tp_total)
+    else:
+        tp_correction = float("nan")
+    
+    # FP Preservation: 原始正确中保持正确的比例
+    orig_correct = pred_orig == gt
+    fp_total = np.sum(orig_correct)
+    if fp_total > 0:
+        fp_preserved = np.sum((orig_correct) & (corrected == gt))
+        fp_preservation = float(fp_preserved) / float(fp_total)
+    else:
+        fp_preservation = float("nan")
+    
+    return modified_rate, tp_correction, fp_preservation
+
+
 def get_digit_token_ids(tokenizer: AutoTokenizer) -> Tuple[List[int], List[int]]:
     digit_ids = {}
     for d in range(10):
@@ -140,7 +207,7 @@ def online_eval(
     mode: str,
     lambd: float,
     device: torch.device,
-) -> Tuple[float, float]:
+) -> Tuple[float, float, float, float, float]:
     digit_id_list, digit_val_list = get_digit_token_ids(tokenizer)
 
     def select_digit(logits: torch.Tensor) -> int:
@@ -156,10 +223,31 @@ def online_eval(
         else torch.zeros(W.shape[0], device=device, dtype=model_dtype)
     )
 
+    # 用于捕获 pre-norm hidden states 的容器和 hook
+    # Qwen3 模型的 hidden_states[-1] 已经过 RMSNorm，需要用 hook 捕获 norm 前的状态
+    captured_prenorm: List[torch.Tensor] = []
+
+    def prenorm_hook(module, args, output):
+        # args[0] 是 norm 层的输入（pre-norm hidden states）
+        captured_prenorm.append(args[0].detach())
+
+    # 注册 hook 到 model.model.norm
+    norm_module = getattr(model.model, "norm", None)
+    hook_handle = None
+    if norm_module is not None:
+        hook_handle = norm_module.register_forward_hook(prenorm_hook)
+
     token_total = 0
     token_correct = 0
     sample_total = 0
     sample_correct = 0
+
+    # 新增统计指标
+    modified_count = 0  # 探针修正了多少token
+    tp_total = 0  # 模型原始错误的token数
+    tp_corrected = 0  # 模型原始错误中被探针修正的数量
+    fp_total = 0  # 模型原始正确的token数
+    fp_preserved = 0  # 模型原始正确中探针保持不变的数量
 
     probe.eval()
     model.eval()
@@ -176,13 +264,17 @@ def online_eval(
             text = text + expr + " = "
 
             model_inputs = tokenizer([text], return_tensors="pt").to(device)
+            # 清空 pre-norm 捕获（每个样本开始前）
+            captured_prenorm.clear()
             outputs = model(
                 **model_inputs,
                 use_cache=True,
                 output_hidden_states=True,
             )
             past = outputs.past_key_values
-            max_layer = len(outputs.hidden_states) - 2
+            # hidden_states[0] = embedding, hidden_states[i] = layer i output
+            # flows 保存时 flow[i] 对应 hidden_states[i]，所以不需要 +1
+            max_layer = len(outputs.hidden_states) - 1
             layer_idx = layer
             if layer_idx < 0:
                 layer_idx = max_layer
@@ -190,11 +282,19 @@ def online_eval(
                 layer_idx = max_layer
 
             generated_digits: List[int] = []
+            original_digits: List[int] = []  # 记录原始模型预测
             for _ in range(max_new_tokens):
                 logits = outputs.logits[:, -1, :]
                 d_pred = select_digit(logits)
+                original_digits.append(d_pred)
                 hidden_states = outputs.hidden_states
-                h = hidden_states[layer_idx + 1][:, -1, :].to(W.dtype)
+
+                # 获取 hidden state
+                # 如果请求的层是最后一层，使用 pre-norm states（与 generate.py 保存时一致）
+                if layer_idx == max_layer and len(captured_prenorm) > 0:
+                    h = captured_prenorm[-1][:, -1, :].to(W.dtype)
+                else:
+                    h = hidden_states[layer_idx][:, -1, :].to(W.dtype)
 
                 if mode == "direct":
                     logits_probe = h @ W.t() + b
@@ -225,16 +325,45 @@ def online_eval(
             sample_total += 1
             g_len = len(generated_digits)
             t_len = len(gt_str)
+            o_len = len(original_digits)
             for i in range(max(g_len, t_len)):
                 token_total += 1
-                if i < t_len and i < g_len and generated_digits[i] == int(gt_str[i]):
+                gt_digit = int(gt_str[i]) if i < t_len else -1
+                orig_digit = original_digits[i] if i < o_len else -1
+                corr_digit = generated_digits[i] if i < g_len else -1
+
+                if i < t_len and i < g_len and corr_digit == gt_digit:
                     token_correct += 1
+
+                # Modified Rate: 探针输出与原始模型输出不同
+                if i < o_len and i < g_len and corr_digit != orig_digit:
+                    modified_count += 1
+
+                # TP Correction: 模型原始错误中被探针修正
+                if i < t_len and i < o_len and orig_digit != gt_digit:
+                    tp_total += 1
+                    if i < g_len and corr_digit == gt_digit:
+                        tp_corrected += 1
+
+                # FP Preservation: 模型原始正确中探针保持不变
+                if i < t_len and i < o_len and orig_digit == gt_digit:
+                    fp_total += 1
+                    if i < g_len and corr_digit == gt_digit:
+                        fp_preserved += 1
+
             if g_len == t_len and all(generated_digits[i] == int(gt_str[i]) for i in range(t_len)):
                 sample_correct += 1
 
+    # 移除 hook
+    if hook_handle is not None:
+        hook_handle.remove()
+
     token_acc = token_correct / token_total if token_total else 0.0
     sample_acc = sample_correct / sample_total if sample_total else 0.0
-    return token_acc, sample_acc
+    modified_rate = modified_count / token_total if token_total else 0.0
+    tp_correction = tp_corrected / tp_total if tp_total else 0.0
+    fp_preservation = fp_preserved / fp_total if fp_total else 0.0
+    return token_acc, sample_acc, modified_rate, tp_correction, fp_preservation
 
 
 def main():
@@ -265,7 +394,7 @@ def main():
 
     dataset_full = load_dataset(args.dataset)
     positions = load_positions(args.h5)
-    flows_all, _, _, gt_digits, pred_digits, sample_ids, _ = build_flat_dataset(
+    flows_all, _, _, gt_digits, pred_digits, sample_ids, pos_ids = build_flat_dataset(
         dataset_full,
         positions,
         positions_filter=args.positions,
@@ -283,12 +412,17 @@ def main():
     val_mask = np.isin(sample_ids, list(val_ids)) if val_ids else np.zeros_like(sample_ids, dtype=bool)
     test_mask = np.isin(sample_ids, list(test_ids)) if test_ids else np.zeros_like(sample_ids, dtype=bool)
 
+    first_error_keep = mask_first_error_positions(pred_digits, gt_digits, sample_ids, pos_ids)
+    train_mask = np.logical_and(train_mask, first_error_keep)
+    val_mask = np.logical_and(val_mask, first_error_keep)
+
     flows_train = flows_all[train_mask]
     gt_train = gt_digits[train_mask]
     flows_val = flows_all[val_mask] if val_mask.any() else flows_all
     gt_val = gt_digits[val_mask] if val_mask.any() else gt_digits
     flows_test = flows_all[test_mask] if test_mask.any() else flows_all
     gt_test = gt_digits[test_mask] if test_mask.any() else gt_digits
+    pred_test = pred_digits[test_mask] if test_mask.any() else pred_digits
     sample_ids_test = sample_ids[test_mask] if test_mask.any() else sample_ids
     sample_ids_val = sample_ids[val_mask] if val_mask.any() else sample_ids
 
@@ -324,6 +458,9 @@ def main():
             corrected_token_acc, corrected_sample_acc = compute_token_sample_acc(
                 corrected, gt_test, sample_ids_test
             )
+            modified_rate, tp_correction, fp_preservation = compute_correction_metrics(
+                corrected, pred_test, gt_test
+            )
         else:
             if args.model is None:
                 raise ValueError("--model is required for online test mode")
@@ -333,9 +470,10 @@ def main():
                 device_map=device,
                 torch_dtype="auto",
                 output_hidden_states=True,
+                do_sample=False,
             )
             dataset_test = [dataset_full[i] for i in sorted(test_ids) if 0 <= i < len(dataset_full)]
-            corrected_token_acc, corrected_sample_acc = online_eval(
+            corrected_token_acc, corrected_sample_acc, modified_rate, tp_correction, fp_preservation = online_eval(
                 dataset_test,
                 tokenizer,
                 lm,
@@ -354,6 +492,9 @@ def main():
             "val_acc": float(best_val_acc),
             "corrected_token_acc": float(corrected_token_acc),
             "corrected_sample_acc": float(corrected_sample_acc),
+            "modified_rate": float(modified_rate),
+            "tp_correction": float(tp_correction),
+            "fp_preservation": float(fp_preservation),
         }
     else:
         lambdas = [float(x.strip()) for x in args.lambda_grid.split(",") if x.strip()]
@@ -380,6 +521,9 @@ def main():
             corrected_token_acc, corrected_sample_acc = compute_token_sample_acc(
                 corrected, gt_test, sample_ids_test
             )
+            modified_rate, tp_correction, fp_preservation = compute_correction_metrics(
+                corrected, pred_test, gt_test
+            )
         else:
             if args.model is None:
                 raise ValueError("--model is required for online test mode")
@@ -389,9 +533,10 @@ def main():
                 device_map=device,
                 torch_dtype="auto",
                 output_hidden_states=True,
+                do_sample=False,
             )
             dataset_test = [dataset_full[i] for i in sorted(test_ids) if 0 <= i < len(dataset_full)]
-            corrected_token_acc, corrected_sample_acc = online_eval(
+            corrected_token_acc, corrected_sample_acc, modified_rate, tp_correction, fp_preservation = online_eval(
                 dataset_test,
                 tokenizer,
                 lm,
@@ -413,6 +558,9 @@ def main():
             "val_token_acc": float(best_val_token_acc),
             "corrected_token_acc": float(corrected_token_acc),
             "corrected_sample_acc": float(corrected_sample_acc),
+            "modified_rate": float(modified_rate),
+            "tp_correction": float(tp_correction),
+            "fp_preservation": float(fp_preservation),
         }
 
     args.output.parent.mkdir(parents=True, exist_ok=True)

@@ -1,9 +1,7 @@
 import argparse
 import json
-import re
 import subprocess
 import sys
-from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -111,78 +109,6 @@ def online_baseline_eval(
     return token_acc, sample_acc
 
 
-def cot_eval(
-    dataset: List[List[int]],
-    tokenizer: AutoTokenizer,
-    model: AutoModelForCausalLM,
-    max_new_tokens: int,
-    device: torch.device,
-) -> Tuple[float, float]:
-    log_dir = Path("VerticalFlow/log/log_cot")
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / f"log_cot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jsonl"
-    token_total = 0
-    token_correct = 0
-    sample_total = 0
-    sample_correct = 0
-
-    model.eval()
-    with torch.no_grad(), log_path.open("w", encoding="utf-8") as log_f:
-        for operands in dataset:
-            gt_val = sum(operands)
-            gt_str = str(gt_val)
-
-            expr = " + ".join(str(x) for x in operands)
-            prompt = f"Calculate {expr}. Think step by step internally, but do not show your reasoning. Only output a number."
-            messages = [{"role": "user", "content": prompt}]
-            text = tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
-            )
-            # 与 generate.py 保持一致，追加表达式与等号以对齐答案段
-            text = text + expr + " = "
-
-            inputs = tokenizer([text], return_tensors="pt").to(device)
-            input_len = inputs["input_ids"].shape[1]
-            generate_outputs = model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                return_dict_in_generate=True,
-                output_hidden_states=True,
-            )
-            generated_tokens = generate_outputs.sequences[0][input_len:]
-            decoded = tokenizer.decode(generated_tokens, skip_special_tokens=False)
-            # 简化逻辑：仅提取最后出现的数字串作为答案
-            matches = re.findall(r"\d+", decoded)
-            pred_str = matches[-1] if matches else ""
-
-            log_record = {
-                "expr": expr,
-                "prompt": prompt,
-                "generated": decoded,
-                "pred": pred_str,
-                "gt": gt_str,
-                "correct": pred_str == gt_str,
-            }
-            log_f.write(json.dumps(log_record, ensure_ascii=False) + "\n")
-
-            sample_total += 1
-            if pred_str == gt_str:
-                sample_correct += 1
-
-            g_len = len(pred_str)
-            t_len = len(gt_str)
-            # 与 online_baseline_eval 对齐：仅统计到 gt 长度，避免额外位惩罚
-            for i in range(t_len):
-                token_total += 1
-                if i < g_len and pred_str[i] == gt_str[i]:
-                    token_correct += 1
-
-    token_acc = token_correct / token_total if token_total else 0.0
-    sample_acc = sample_correct / sample_total if sample_total else 0.0
-    return token_acc, sample_acc
-
-
 def load_baseline_metrics(
     h5_path: Path,
     dataset_path: Path,
@@ -257,7 +183,7 @@ def main():
     parser.add_argument("--val-ratio", type=float, default=0.1)
     parser.add_argument("--test-ratio", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--method", type=str, choices=["cot", "linear", "mlp", "steer", "force", "all"], default="all")
+    parser.add_argument("--method", type=str, choices=["linear", "mlp", "steer", "force", "all"], default="all")
     parser.add_argument("--model", type=str, default="/data/Models/Qwen3-4b")
     parser.add_argument("--max-new-tokens", type=int, default=25)
     parser.add_argument("--layer-start", type=int, default=None)
@@ -271,7 +197,7 @@ def main():
     parser.add_argument("--skip-orig", action="store_true", help="Skip original acc and SPI computations")
     args = parser.parse_args()
 
-    methods = [args.method] if args.method != "all" else ["cot", "linear", "mlp", "steer", "force"]
+    methods = [args.method] if args.method != "all" else ["linear", "mlp", "steer", "force"]
 
     base_metrics, arrays = load_baseline_metrics(
         args.h5,
@@ -287,7 +213,7 @@ def main():
     dataset_test = None
     tokenizer = None
     lm = None
-    need_local_model = (not args.skip_orig) or ("cot" in methods)
+    need_local_model = not args.skip_orig
     if need_local_model:
         if args.model is None:
             raise ValueError("--model is required for online test mode")
@@ -325,19 +251,7 @@ def main():
     for method in methods:
         print("\n" + "=" * 60)
         print(f"Method: {method}")
-        if method == "cot":
-            corrected_token_acc, corrected_sample_acc = cot_eval(
-                dataset_test,
-                tokenizer,
-                lm,
-                args.max_new_tokens,
-                device,
-            )
-            corrected_metrics = {
-                "corrected_token_acc": float(corrected_token_acc),
-                "corrected_sample_acc": float(corrected_sample_acc),
-            }
-        elif method == "linear":
+        if method == "linear":
             out_path = args.out_dir / "linear_probe.json"
             cmd = [
                 sys.executable,
