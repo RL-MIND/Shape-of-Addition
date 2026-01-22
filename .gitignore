@@ -3,3 +3,4 @@ __pycache__/
 results/
 saved_models/
 plot_auc.py
+test.py

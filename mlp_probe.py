@@ -1,7 +1,7 @@
 import argparse
 import json
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import numpy as np
 import torch
@@ -197,6 +197,272 @@ def get_digit_token_ids(tokenizer: AutoTokenizer) -> Tuple[List[int], List[int]]
     return digit_id_list, digit_val_list
 
 
+def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """
+    对输入应用 RMSNorm（与 Qwen3 模型内部归一化步骤相同）。
+    
+    Args:
+        x: 输入张量，shape (..., hidden_dim)
+        weight: RMSNorm 的 weight 参数，shape (hidden_dim,)
+        eps: 防止除零的小常数
+    
+    Returns:
+        归一化后的张量
+    """
+    variance = x.pow(2).mean(dim=-1, keepdim=True)
+    x_normed = x * torch.rsqrt(variance + eps)
+    return x_normed * weight
+
+
+def apply_rms_norm_to_flows(
+    flows: np.ndarray,
+    norm_weight: torch.Tensor,
+    layer_idx: int,
+    eps: float = 1e-6,
+) -> np.ndarray:
+    """
+    对 flows 指定层应用 RMSNorm。
+    
+    Args:
+        flows: shape (N, num_layers, hidden_dim)
+        norm_weight: RMSNorm 的 weight 参数
+        layer_idx: 要归一化的层索引
+        eps: 防止除零的小常数
+    
+    Returns:
+        归一化后的 flows
+    """
+    flows_tensor = torch.tensor(flows[:, layer_idx, :], dtype=torch.float32)
+    weight = norm_weight.float().cpu()
+    normed = rms_norm(flows_tensor, weight, eps)
+    flows_out = flows.copy()
+    flows_out[:, layer_idx, :] = normed.numpy()
+    return flows_out
+
+
+def get_norm_weight_from_model(model_path: str, device: torch.device) -> Tuple[torch.Tensor, float]:
+    """
+    从模型中提取 RMSNorm 的 weight 参数。
+    
+    Returns:
+        (weight, eps): norm 层的 weight 和 eps 参数
+    """
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        device_map=device,
+        torch_dtype="auto",
+    )
+    norm_module = getattr(model.model, "norm", None)
+    if norm_module is None:
+        raise RuntimeError("Model does not have model.model.norm")
+    weight = norm_module.weight.detach().clone()
+    eps = getattr(norm_module, "variance_epsilon", getattr(norm_module, "eps", 1e-6))
+    del model
+    torch.cuda.empty_cache()
+    return weight, eps
+
+
+def online_eval_prompt(
+    dataset: List[List[int]],
+    tokenizer: AutoTokenizer,
+    model: AutoModelForCausalLM,
+    probe: nn.Module,
+    layer: int,
+    max_new_tokens: int,
+    device: torch.device,
+    norm_weight: Optional[torch.Tensor] = None,
+    norm_eps: float = 1e-6,
+) -> Tuple[float, float, float, float, float]:
+    """
+    Prompt correction 模式的 online evaluation。
+    
+    当探针检测到当前位置可能错误时：
+    1. 保留模型的原始输出
+    2. 追加修正提示语 "That step looks incorrect. Let's re-do just this step:"
+    3. 追加原算式的前半部分（到等号），让模型重新计算
+    """
+    digit_id_list, digit_val_list = get_digit_token_ids(tokenizer)
+
+    def select_digit(logits: torch.Tensor) -> int:
+        digit_logits = logits[:, digit_id_list]
+        idx = torch.argmax(digit_logits, dim=1).item()
+        return digit_val_list[idx]
+
+    # 用于捕获 pre-norm hidden states 的容器和 hook
+    captured_prenorm: List[torch.Tensor] = []
+
+    def prenorm_hook(module, args, output):
+        captured_prenorm.append(args[0].detach())
+
+    norm_module = getattr(model.model, "norm", None)
+    hook_handle = None
+    if norm_module is not None:
+        hook_handle = norm_module.register_forward_hook(prenorm_hook)
+
+    token_total = 0
+    token_correct = 0
+    sample_total = 0
+    sample_correct = 0
+
+    modified_count = 0
+    tp_total = 0
+    tp_corrected = 0
+    fp_total = 0
+    fp_preserved = 0
+
+    correction_prompt = " That step looks incorrect. Let's re-do just this step: "
+
+    probe.eval()
+    model.eval()
+    with torch.no_grad():
+        for operands in dataset:
+            gt_val = sum(operands)
+            gt_str = str(gt_val)
+
+            expr = " + ".join(str(x) for x in operands)
+            messages = [{"role": "user", "content": f"Calculate {expr}. Only output a number."}]
+            text = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
+            )
+            prefix = text + expr + " = "
+
+            model_inputs = tokenizer([prefix], return_tensors="pt").to(device)
+            captured_prenorm.clear()
+            outputs = model(
+                **model_inputs,
+                use_cache=True,
+                output_hidden_states=True,
+            )
+            past = outputs.past_key_values
+            max_layer = len(outputs.hidden_states) - 1
+            layer_idx = layer
+            if layer_idx < 0:
+                layer_idx = max_layer
+            if layer_idx > max_layer:
+                layer_idx = max_layer
+
+            generated_digits: List[int] = []
+            original_digits: List[int] = []
+            current_output_str = ""  # 当前已输出的数字字符串
+
+            step = 0
+            while step < max_new_tokens:
+                logits = outputs.logits[:, -1, :]
+                d_pred = select_digit(logits)
+                original_digits.append(d_pred)
+                hidden_states = outputs.hidden_states
+
+                # 获取 hidden state（使用 pre-norm 如果是最后一层）
+                if layer_idx == max_layer and len(captured_prenorm) > 0:
+                    h = captured_prenorm[-1][:, -1, :]
+                else:
+                    h = hidden_states[layer_idx][:, -1, :]
+
+                # 应用 RMSNorm（与模型内部归一化步骤相同）
+                if norm_weight is not None:
+                    h = rms_norm(h, norm_weight.to(h.device), norm_eps)
+
+                probe_dtype = next(probe.parameters()).dtype
+                if h.dtype != probe_dtype:
+                    h = h.to(dtype=probe_dtype)
+                logits_probe = probe(h)
+                probe_digit = int(torch.argmax(logits_probe, dim=1).item())
+
+                # 先写入模型预测的数字（无论是否正确）
+                next_token_id = digit_id_list[d_pred]
+                next_input = torch.tensor([[next_token_id]], device=device)
+                captured_prenorm.clear()
+                outputs = model(
+                    input_ids=next_input,
+                    past_key_values=past,
+                    use_cache=True,
+                    output_hidden_states=True,
+                )
+                past = outputs.past_key_values
+                generated_digits.append(d_pred)
+                current_output_str += str(d_pred)
+
+                # 检测是否需要干预（在数字已经写入 past 之后）
+                if probe_digit != d_pred:
+                    # 探针认为模型输出错误，启动 prompt correction
+                    modified_count += 1
+
+                    # 追加修正提示，只包含已正确的部分（不包含错误的数字和探针的建议）
+                    # 格式: "That step looks incorrect. Let's re-do just this step: {expr} = {已正确的部分}"
+                    # 例如：578 -> "That step looks incorrect. Let's re-do just this step: 123 + 456 = 57"
+                    correction_text = correction_prompt + expr + " = " + current_output_str[:-1]
+                    correction_ids = tokenizer.encode(correction_text, add_special_tokens=False)
+                    correction_input = torch.tensor([correction_ids], device=device)
+                    captured_prenorm.clear()
+                    outputs = model(
+                        input_ids=correction_input,
+                        past_key_values=past,
+                        use_cache=True,
+                        output_hidden_states=True,
+                    )
+                    past = outputs.past_key_values
+
+                    # 让模型重新生成这一位的数字
+                    logits_new = outputs.logits[:, -1, :]
+                    corrected_digit = select_digit(logits_new)
+                    
+                    # 更新 generated_digits：替换上一个错误的数字为模型重新生成的数字
+                    generated_digits[-1] = corrected_digit
+                    current_output_str = current_output_str[:-1] + str(corrected_digit)
+                    
+                    # 将新数字写入 past
+                    next_token_id = digit_id_list[corrected_digit]
+                    next_input = torch.tensor([[next_token_id]], device=device)
+                    captured_prenorm.clear()
+                    outputs = model(
+                        input_ids=next_input,
+                        past_key_values=past,
+                        use_cache=True,
+                        output_hidden_states=True,
+                    )
+                    past = outputs.past_key_values
+
+                step += 1
+                if len(generated_digits) >= len(gt_str):
+                    break
+
+            sample_total += 1
+            g_len = len(generated_digits)
+            t_len = len(gt_str)
+            o_len = len(original_digits)
+            for i in range(max(g_len, t_len)):
+                token_total += 1
+                gt_digit = int(gt_str[i]) if i < t_len else -1
+                orig_digit = original_digits[i] if i < o_len else -1
+                corr_digit = generated_digits[i] if i < g_len else -1
+
+                if i < t_len and i < g_len and corr_digit == gt_digit:
+                    token_correct += 1
+
+                if i < t_len and i < o_len and orig_digit != gt_digit:
+                    tp_total += 1
+                    if i < g_len and corr_digit == gt_digit:
+                        tp_corrected += 1
+
+                if i < t_len and i < o_len and orig_digit == gt_digit:
+                    fp_total += 1
+                    if i < g_len and corr_digit == gt_digit:
+                        fp_preserved += 1
+
+            if g_len == t_len and all(generated_digits[i] == int(gt_str[i]) for i in range(t_len)):
+                sample_correct += 1
+
+    if hook_handle is not None:
+        hook_handle.remove()
+
+    token_acc = token_correct / token_total if token_total else 0.0
+    sample_acc = sample_correct / sample_total if sample_total else 0.0
+    modified_rate = modified_count / token_total if token_total else 0.0
+    tp_correction = tp_corrected / tp_total if tp_total else 0.0
+    fp_preservation = fp_preserved / fp_total if fp_total else 0.0
+    return token_acc, sample_acc, modified_rate, tp_correction, fp_preservation
+
+
 def online_eval(
     dataset: List[List[int]],
     tokenizer: AutoTokenizer,
@@ -205,7 +471,26 @@ def online_eval(
     layer: int,
     max_new_tokens: int,
     device: torch.device,
+    mode: str = "direct",  # "direct" 或 "prompt"
+    norm_weight: Optional[torch.Tensor] = None,
+    norm_eps: float = 1e-6,
 ) -> Tuple[float, float, float, float, float]:
+    """
+    Online evaluation with probe correction.
+    
+    Args:
+        mode: 
+            - "direct": 直接用探针预测替换模型输出
+            - "prompt": 当探针检测到错误时，追加修正提示让模型重新计算
+        norm_weight: RMSNorm 的 weight 参数（可选）
+        norm_eps: RMSNorm 的 eps 参数
+    """
+    if mode == "prompt":
+        return online_eval_prompt(
+            dataset, tokenizer, model, probe, layer, max_new_tokens, device,
+            norm_weight=norm_weight, norm_eps=norm_eps
+        )
+    
     digit_id_list, digit_val_list = get_digit_token_ids(tokenizer)
 
     def select_digit(logits: torch.Tensor) -> int:
@@ -283,6 +568,10 @@ def online_eval(
                     h = captured_prenorm[-1][:, -1, :]
                 else:
                     h = hidden_states[layer_idx][:, -1, :]
+
+                # 应用 RMSNorm（与模型内部归一化步骤相同）
+                if norm_weight is not None:
+                    h = rms_norm(h, norm_weight.to(h.device), norm_eps)
 
                 probe_dtype = next(probe.parameters()).dtype
                 if h.dtype != probe_dtype:
@@ -366,12 +655,21 @@ def main():
     parser.add_argument("--layer-start", type=int, default=None)
     parser.add_argument("--layer-end", type=int, default=None)
     parser.add_argument("--test-mode", type=str, choices=["online", "offline"], default="online")
+    parser.add_argument("--mode", type=str, choices=["direct", "prompt"], default="direct",
+                        help="Correction mode: direct (replace with probe output) or prompt (append correction prompt)")
     parser.add_argument("--model", type=str, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=25)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # 加载 RMSNorm 参数
+    if args.model is None:
+        raise ValueError("--model is required to load RMSNorm parameters")
+    print(f"Loading RMSNorm parameters from {args.model}...")
+    norm_weight, norm_eps = get_norm_weight_from_model(args.model, device)
+    print(f"RMSNorm eps: {norm_eps}")
 
     dataset_full = load_dataset(args.dataset)
     positions = load_positions(args.h5)
@@ -380,6 +678,11 @@ def main():
         positions,
         positions_filter=args.positions,
     )
+
+    # 对 flows 最后一层应用 RMSNorm
+    num_layers = flows_all.shape[1]
+    print(f"Applying RMSNorm to flows (last layer {num_layers - 1})...")
+    flows_all = apply_rms_norm_to_flows(flows_all, norm_weight, num_layers - 1, norm_eps)
 
     train_ids, val_ids, test_ids = split_sample_ids(
         sample_ids,
@@ -406,7 +709,6 @@ def main():
     pred_test = pred_digits[test_mask] if test_mask.any() else pred_digits
     sample_ids_test = sample_ids[test_mask] if test_mask.any() else sample_ids
 
-    num_layers = flows_all.shape[1]
     candidate_layers = parse_layer_candidates(num_layers, args.layers, args.layer_start, args.layer_end)
 
     best_layer = None
@@ -452,6 +754,14 @@ def main():
             do_sample=False,
         )
         dataset_test = [dataset_full[i] for i in sorted(test_ids) if 0 <= i < len(dataset_full)]
+        # 从已加载的模型中获取 norm_weight
+        norm_module = getattr(lm.model, "norm", None)
+        if norm_module is not None:
+            online_norm_weight = norm_module.weight.detach().clone()
+            online_norm_eps = getattr(norm_module, "variance_epsilon", getattr(norm_module, "eps", 1e-6))
+        else:
+            online_norm_weight = norm_weight
+            online_norm_eps = norm_eps
         corrected_token_acc, corrected_sample_acc, modified_rate, tp_correction, fp_preservation = online_eval(
             dataset_test,
             tokenizer,
@@ -460,11 +770,15 @@ def main():
             best_layer,
             args.max_new_tokens,
             device=device,
+            mode=args.mode,
+            norm_weight=online_norm_weight,
+            norm_eps=online_norm_eps,
         )
 
     payload = {
         "method": "mlp_probe",
         "test_mode": args.test_mode,
+        "mode": args.mode,
         "layer": int(best_layer),
         "val_acc": float(best_val_acc),
         "corrected_token_acc": float(corrected_token_acc),
@@ -476,6 +790,7 @@ def main():
 
     print("\n=== MLP Probe Results ===")
     print(f"Best layer: {best_layer}")
+    print(f"Mode: {args.mode}")
     print(f"Validation accuracy: {best_val_acc:.4f}")
     print(f"Corrected token accuracy: {corrected_token_acc:.4f}")
     print(f"Corrected sample accuracy: {corrected_sample_acc:.4f}")

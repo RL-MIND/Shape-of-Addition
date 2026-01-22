@@ -3,7 +3,7 @@ import copy
 import json
 import math
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import torch
@@ -513,6 +513,45 @@ def get_digit_token_ids(tokenizer: AutoTokenizer) -> Tuple[List[int], List[int]]
     return digit_id_list, digit_val_list
 
 
+def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """对输入应用 RMSNorm。"""
+    variance = x.pow(2).mean(dim=-1, keepdim=True)
+    x_normed = x * torch.rsqrt(variance + eps)
+    return x_normed * weight
+
+
+def apply_rms_norm_to_flows(
+    flows: np.ndarray,
+    norm_weight: torch.Tensor,
+    layer_idx: int,
+    eps: float = 1e-6,
+) -> np.ndarray:
+    """对 flows 指定层应用 RMSNorm。"""
+    flows_tensor = torch.tensor(flows[:, layer_idx, :], dtype=torch.float32)
+    weight = norm_weight.float().cpu()
+    normed = rms_norm(flows_tensor, weight, eps)
+    flows_out = flows.copy()
+    flows_out[:, layer_idx, :] = normed.numpy()
+    return flows_out
+
+
+def get_norm_weight_from_model(model_path: str, device: torch.device) -> Tuple[torch.Tensor, float]:
+    """从模型中提取 RMSNorm 的 weight 参数。"""
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        device_map=device,
+        torch_dtype="auto",
+    )
+    norm_module = getattr(model.model, "norm", None)
+    if norm_module is None:
+        raise RuntimeError("Model does not have model.model.norm")
+    weight = norm_module.weight.detach().clone()
+    eps = getattr(norm_module, "variance_epsilon", getattr(norm_module, "eps", 1e-6))
+    del model
+    torch.cuda.empty_cache()
+    return weight, eps
+
+
 def online_force_eval(
     dataset: List[List[int]],
     tokenizer: AutoTokenizer,
@@ -527,6 +566,8 @@ def online_force_eval(
     vector_steer: bool = False,
     dir01: Dict[int, torch.Tensor] | None = None,
     dir12: Dict[int, torch.Tensor] | None = None,
+    norm_weight: Optional[torch.Tensor] = None,
+    norm_eps: float = 1e-6,
 ) -> Tuple[float, float, float, float, float]:
     digit_id_list, digit_val_list = get_digit_token_ids(tokenizer)
 
@@ -638,6 +679,11 @@ def online_force_eval(
                 else:
                     inertia_h = hidden_states[inertia_layer_idx][:, -1, :]
 
+                # 应用 RMSNorm（与模型内部归一化步骤相同）
+                if norm_weight is not None:
+                    raw_h = rms_norm(raw_h, norm_weight.to(raw_h.device).to(raw_h.dtype), norm_eps)
+                    inertia_h = rms_norm(inertia_h, norm_weight.to(inertia_h.device).to(inertia_h.dtype), norm_eps)
+
                 raw_dtype = next(raw_model.parameters()).dtype
                 carry_dtype = next(carry_model.parameters()).dtype
                 if raw_h.dtype != raw_dtype:
@@ -702,18 +748,18 @@ def online_force_eval(
                     chosen_digit = int(d_pred)
                 generated_digits.append(chosen_digit)
 
-                # 测试：对于错误位置，使用ground truth作为输入token（teacher forcing）
-                current_pos = len(generated_digits) - 1
-                if current_pos < len(gt_str):
-                    gt_digit = int(gt_str[current_pos])
-                    # 如果当前位置预测错误，使用正确答案作为下一个输入
-                    if chosen_digit != gt_digit:
-                        next_token_id = digit_id_list[gt_digit]
-                    else:
-                        next_token_id = digit_id_list[chosen_digit]
-                else:
-                    next_token_id = digit_id_list[chosen_digit]
-                # next_token_id = digit_id_list[chosen_digit]
+                # # 测试：对于错误位置，使用ground truth作为输入token（teacher forcing）
+                # current_pos = len(generated_digits) - 1
+                # if current_pos < len(gt_str):
+                #     gt_digit = int(gt_str[current_pos])
+                #     # 如果当前位置预测错误，使用正确答案作为下一个输入
+                #     if chosen_digit != gt_digit:
+                #         next_token_id = digit_id_list[gt_digit]
+                #     else:
+                #         next_token_id = digit_id_list[chosen_digit]
+                # else:
+                #     next_token_id = digit_id_list[chosen_digit]
+                next_token_id = digit_id_list[chosen_digit]
                 next_input = torch.tensor([[next_token_id]], device=device)
                 outputs = model(
                     input_ids=next_input,
@@ -819,6 +865,12 @@ def main():
 
     dataset_full = load_dataset(args.dataset)
     positions = load_positions(args.h5)
+
+    # 加载 RMSNorm 参数
+    print(f"Loading RMSNorm parameters from {args.model}...")
+    norm_weight, norm_eps = get_norm_weight_from_model(args.model, device)
+    print(f"RMSNorm eps: {norm_eps}")
+
     def _parse_layer(val: str):
         if isinstance(val, str) and val.lower() == "none":
             return None
@@ -831,6 +883,11 @@ def main():
         positions,
         positions_filter=args.positions,
     )
+
+    # 对 flows 最后一层应用 RMSNorm
+    num_layers = flows_all.shape[1]
+    print(f"Applying RMSNorm to flows (last layer {num_layers - 1})...")
+    flows_all = apply_rms_norm_to_flows(flows_all, norm_weight, num_layers - 1, norm_eps)
 
     train_ids, val_ids, test_ids = split_sample_ids(
         sample_ids,
@@ -1145,6 +1202,14 @@ def main():
                 if dir12_np.get(d) is not None:
                     dir12[d] = torch.tensor(dir12_np[d], dtype=head_dtype, device=device).unsqueeze(0)
         dataset_test = [dataset_full[i] for i in sorted(test_ids) if 0 <= i < len(dataset_full)]
+        # 从已加载的模型中获取 norm_weight
+        norm_module = getattr(lm.model, "norm", None)
+        if norm_module is not None:
+            online_norm_weight = norm_module.weight.detach().clone()
+            online_norm_eps = getattr(norm_module, "variance_epsilon", getattr(norm_module, "eps", 1e-6))
+        else:
+            online_norm_weight = norm_weight
+            online_norm_eps = norm_eps
         corrected_token_acc, corrected_sample_acc, modified_rate, tp_correction, fp_preservation = online_force_eval(
             dataset_test,
             tokenizer,
@@ -1159,6 +1224,8 @@ def main():
             vector_steer=args.vector_steer,
             dir01=dir01,
             dir12=dir12,
+            norm_weight=online_norm_weight,
+            norm_eps=online_norm_eps,
         )
 
     print("\n=== Force probe (test) ===")

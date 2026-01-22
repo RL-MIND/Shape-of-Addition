@@ -1,7 +1,7 @@
 import argparse
 import json
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import numpy as np
 import torch
@@ -197,6 +197,45 @@ def get_digit_token_ids(tokenizer: AutoTokenizer) -> Tuple[List[int], List[int]]
     return digit_id_list, digit_val_list
 
 
+def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """对输入应用 RMSNorm。"""
+    variance = x.pow(2).mean(dim=-1, keepdim=True)
+    x_normed = x * torch.rsqrt(variance + eps)
+    return x_normed * weight
+
+
+def apply_rms_norm_to_flows(
+    flows: np.ndarray,
+    norm_weight: torch.Tensor,
+    layer_idx: int,
+    eps: float = 1e-6,
+) -> np.ndarray:
+    """对 flows 指定层应用 RMSNorm。"""
+    flows_tensor = torch.tensor(flows[:, layer_idx, :], dtype=torch.float32)
+    weight = norm_weight.float().cpu()
+    normed = rms_norm(flows_tensor, weight, eps)
+    flows_out = flows.copy()
+    flows_out[:, layer_idx, :] = normed.numpy()
+    return flows_out
+
+
+def get_norm_weight_from_model(model_path: str, device: torch.device) -> Tuple[torch.Tensor, float]:
+    """从模型中提取 RMSNorm 的 weight 参数。"""
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        device_map=device,
+        torch_dtype="auto",
+    )
+    norm_module = getattr(model.model, "norm", None)
+    if norm_module is None:
+        raise RuntimeError("Model does not have model.model.norm")
+    weight = norm_module.weight.detach().clone()
+    eps = getattr(norm_module, "variance_epsilon", getattr(norm_module, "eps", 1e-6))
+    del model
+    torch.cuda.empty_cache()
+    return weight, eps
+
+
 def online_eval(
     dataset: List[List[int]],
     tokenizer: AutoTokenizer,
@@ -207,6 +246,8 @@ def online_eval(
     mode: str,
     lambd: float,
     device: torch.device,
+    norm_weight: Optional[torch.Tensor] = None,
+    norm_eps: float = 1e-6,
 ) -> Tuple[float, float, float, float, float]:
     digit_id_list, digit_val_list = get_digit_token_ids(tokenizer)
 
@@ -295,6 +336,10 @@ def online_eval(
                     h = captured_prenorm[-1][:, -1, :].to(W.dtype)
                 else:
                     h = hidden_states[layer_idx][:, -1, :].to(W.dtype)
+
+                # 应用 RMSNorm（与模型内部归一化步骤相同）
+                if norm_weight is not None:
+                    h = rms_norm(h, norm_weight.to(h.device).to(h.dtype), norm_eps)
 
                 if mode == "direct":
                     logits_probe = h @ W.t() + b
@@ -392,6 +437,13 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    # 加载 RMSNorm 参数
+    if args.model is None:
+        raise ValueError("--model is required to load RMSNorm parameters")
+    print(f"Loading RMSNorm parameters from {args.model}...")
+    norm_weight, norm_eps = get_norm_weight_from_model(args.model, device)
+    print(f"RMSNorm eps: {norm_eps}")
+
     dataset_full = load_dataset(args.dataset)
     positions = load_positions(args.h5)
     flows_all, _, _, gt_digits, pred_digits, sample_ids, pos_ids = build_flat_dataset(
@@ -399,6 +451,11 @@ def main():
         positions,
         positions_filter=args.positions,
     )
+
+    # 对 flows 最后一层应用 RMSNorm
+    num_layers = flows_all.shape[1]
+    print(f"Applying RMSNorm to flows (last layer {num_layers - 1})...")
+    flows_all = apply_rms_norm_to_flows(flows_all, norm_weight, num_layers - 1, norm_eps)
 
     train_ids, val_ids, test_ids = split_sample_ids(
         sample_ids,
@@ -426,7 +483,6 @@ def main():
     sample_ids_test = sample_ids[test_mask] if test_mask.any() else sample_ids
     sample_ids_val = sample_ids[val_mask] if val_mask.any() else sample_ids
 
-    num_layers = flows_all.shape[1]
     candidate_layers = parse_layer_candidates(num_layers, args.layers, args.layer_start, args.layer_end)
 
     best_layer = None
@@ -473,6 +529,14 @@ def main():
                 do_sample=False,
             )
             dataset_test = [dataset_full[i] for i in sorted(test_ids) if 0 <= i < len(dataset_full)]
+            # 从已加载的模型中获取 norm_weight
+            norm_module = getattr(lm.model, "norm", None)
+            if norm_module is not None:
+                online_norm_weight = norm_module.weight.detach().clone()
+                online_norm_eps = getattr(norm_module, "variance_epsilon", getattr(norm_module, "eps", 1e-6))
+            else:
+                online_norm_weight = norm_weight
+                online_norm_eps = norm_eps
             corrected_token_acc, corrected_sample_acc, modified_rate, tp_correction, fp_preservation = online_eval(
                 dataset_test,
                 tokenizer,
@@ -483,6 +547,8 @@ def main():
                 mode="direct",
                 lambd=0.0,
                 device=device,
+                norm_weight=online_norm_weight,
+                norm_eps=online_norm_eps,
             )
         payload = {
             "method": "linear_probe",
@@ -536,6 +602,14 @@ def main():
                 do_sample=False,
             )
             dataset_test = [dataset_full[i] for i in sorted(test_ids) if 0 <= i < len(dataset_full)]
+            # 从已加载的模型中获取 norm_weight
+            norm_module = getattr(lm.model, "norm", None)
+            if norm_module is not None:
+                online_norm_weight = norm_module.weight.detach().clone()
+                online_norm_eps = getattr(norm_module, "variance_epsilon", getattr(norm_module, "eps", 1e-6))
+            else:
+                online_norm_weight = norm_weight
+                online_norm_eps = norm_eps
             corrected_token_acc, corrected_sample_acc, modified_rate, tp_correction, fp_preservation = online_eval(
                 dataset_test,
                 tokenizer,
@@ -546,6 +620,8 @@ def main():
                 mode="steer",
                 lambd=best_lambda,
                 device=device,
+                norm_weight=online_norm_weight,
+                norm_eps=online_norm_eps,
             )
         payload = {
             "method": "linear_probe",

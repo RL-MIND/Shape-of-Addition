@@ -183,21 +183,21 @@ def main():
     parser.add_argument("--val-ratio", type=float, default=0.1)
     parser.add_argument("--test-ratio", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--method", type=str, choices=["linear", "mlp", "steer", "force", "all"], default="all")
+    parser.add_argument("--method", type=str, choices=["linear", "mlp", "steer", "force", "prompt", "all"], default="all")
     parser.add_argument("--model", type=str, default="/data/Models/Qwen3-4b")
     parser.add_argument("--max-new-tokens", type=int, default=25)
     parser.add_argument("--layer-start", type=int, default=None)
     parser.add_argument("--layer-end", type=int, default=None)
     parser.add_argument("--layers", type=int, nargs="*", default=None)
     parser.add_argument("--lambda-grid", type=str, default="0.0,0.25,0.5,0.75,1.0")
-    parser.add_argument("--out-dir", type=Path, default=Path("VerticalFlow/results/experiments"))
+    parser.add_argument("--out-dir", type=Path, default=Path("VerticalFlow/log/log_experiments"))
     parser.add_argument("--force-script", type=Path, default=Path("VerticalFlow/force_probe.py"))
     parser.add_argument("--linear-script", type=Path, default=Path("VerticalFlow/linear_probe.py"))
     parser.add_argument("--mlp-script", type=Path, default=Path("VerticalFlow/mlp_probe.py"))
     parser.add_argument("--skip-orig", action="store_true", help="Skip original acc and SPI computations")
     args = parser.parse_args()
 
-    methods = [args.method] if args.method != "all" else ["linear", "mlp", "steer", "force"]
+    methods = [args.method] if args.method != "all" else ["linear", "mlp", "steer", "force", "prompt"]
 
     base_metrics, arrays = load_baseline_metrics(
         args.h5,
@@ -371,6 +371,39 @@ def main():
             cmd += ["--test-mode", "online", "--model", args.model, "--max-new-tokens", str(args.max_new_tokens)]
             if args.positions:
                 cmd += ["--positions", *[str(p) for p in args.positions]]
+            run_script(cmd)
+            corrected_metrics = load_json(out_path)
+        elif method == "prompt":
+            out_path = args.out_dir / "mlp_probe_prompt.json"
+            cmd = [
+                sys.executable,
+                str(args.mlp_script),
+                "--h5",
+                str(args.h5),
+                "--dataset",
+                str(args.dataset),
+                "--train-ratio",
+                str(args.train_ratio),
+                "--val-ratio",
+                str(args.val_ratio),
+                "--test-ratio",
+                str(args.test_ratio),
+                "--seed",
+                str(args.seed),
+                "--mode",
+                "prompt",
+                "--output",
+                str(out_path),
+            ]
+            cmd += ["--test-mode", "online", "--model", args.model, "--max-new-tokens", str(args.max_new_tokens)]
+            if args.positions:
+                cmd += ["--positions", *[str(p) for p in args.positions]]
+            if args.layers:
+                cmd += ["--layers", *[str(l) for l in args.layers]]
+            if args.layer_start is not None:
+                cmd += ["--layer-start", str(args.layer_start)]
+            if args.layer_end is not None:
+                cmd += ["--layer-end", str(args.layer_end)]
             run_script(cmd)
             corrected_metrics = load_json(out_path)
         else:
