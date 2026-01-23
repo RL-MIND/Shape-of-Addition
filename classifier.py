@@ -8,11 +8,20 @@ import numpy as np
 import logging
 import os
 import builtins
+import argparse
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, roc_auc_score, f1_score
 from sklearn.decomposition import PCA
 from pathlib import Path
 from datetime import datetime
+from typing import Tuple, Optional
+
+try:
+    from transformers import AutoModelForCausalLM
+    HAS_TRANSFORMERS = True
+except ImportError:
+    HAS_TRANSFORMERS = False
+    print("提示: 安装 transformers 可以启用 RMSNorm 功能: pip install transformers")
 
 try:
     import h5py
@@ -42,7 +51,7 @@ DATA_FILE_PATH = 'VerticalFlow/results/plus_num3len10_Qwen3-4b/plus_num3len10_Qw
 # DATA_FILE_PATH = 'results/plus_num5len20_Qwen3-4B-Instruct-2507'
 
 BALANCE_DATASET = False           # 是否平衡数据集（使两个类别数量相等）
-STRONG_BALANCE_BY_POSITION = True  # 是否按位置先平衡再合并（每个位置内类别均衡）
+STRONG_BALANCE_BY_POSITION = True # 是否按位置先平衡再合并（每个位置内类别均衡）
 TEST_SIZE = 0.2                  # 划分验证集比例
 
 # 选择使用哪些位置的数据进行训练
@@ -51,13 +60,28 @@ TEST_SIZE = 0.2                  # 划分验证集比例
 #   - [0, 1, 2, ...]: 指定位置列表
 #   - 0, 1, 2, ...: 单个位置（整数）
 #   - 'extra': 只使用extra位置
-POSITION_SELECT = 3
+POSITION_SELECT = 'all'
 
 # 选择使用哪种特征
 FEATURE_TYPE = 'flows'  # 'flows', 'velocities', 'curvatures'
 
 # Pooling配置（对seq_len维度进行池化降维）
-POOLING_TYPE = 'None'    # None, 'avg', 'max'
+POOLING_TYPE = None    # None, 'avg', 'max'
+
+# --- 任务类型配置 ---
+# 可选任务:
+#   - 'correct_or_wrong': 二分类，预测模型输出是否正确（原默认行为）
+#   - 'pred_digit': 10分类，预测模型实际输出的数字（0-9）
+#   - 'gt_digit': 10分类，预测真实答案数字（0-9）
+#   - 'in_carry': 多分类，预测进位值（0-2，适用于加法）
+#   - 'raw_sum': 10分类，预测该位置忽略进位的值（所有加数之和 % 10）
+TASK_TYPE = 'pred_digit'
+
+# --- RMSNorm 配置 ---
+# 是否对每一层数据应用 RMSNorm（需要指定模型路径以加载 norm 权重）
+APPLY_NORM = True
+# 模型路径（用于加载 RMSNorm 权重，仅当 APPLY_NORM=True 时需要）
+NORM_MODEL_PATH = '/data/Models/Qwen3-4b'
 
 # 按层评估开关
 # 打开后会逐层训练/验证，每层单独跑一遍完整训练流程，取验证集 AUC 最高的 epoch 作为该层得分
@@ -82,7 +106,7 @@ CIRCULAR_PROBE_EPOCHS = 300    # CircularProbe训练epoch数（不使用early st
 
 # --- 3. 模型选择 ---
 # 可选: 'mlp', 'mlp10', 'transformer', 'logreg', 'ar_transformer', 'lstm', 'circular_probe', 'spiral_probe'
-MODEL_TYPE = 'mlp10'
+MODEL_TYPE = 'logreg'
 
 # --- 3.1 模型存储 ---
 SAVE_MODEL = False               # 是否在训练结束后保存模型
@@ -99,8 +123,6 @@ TRANSFORMER_NHEAD = 2            # 多头注意力头数
 TRANSFORMER_NUM_LAYERS = 2       # Transformer编码器层数
 TRANSFORMER_DIM_FEEDFORWARD = 1024  # 前馈网络隐藏层维度
 TRANSFORMER_DROPOUT = 0.1        # Transformer Dropout比率
-
-# (已删除 CNN 和 SVM 相关配置)
 
 # --- 8. Autoregressive Transformer 参数 ---
 AR_TRANSFORMER_D_MODEL = 256        # 模型维度
@@ -184,6 +206,84 @@ def log_print(*args, **kwargs):
 
 # 覆盖全局 print，使后续 print 自动写入日志
 print = log_print
+
+
+# ==========================================
+# ========== RMSNorm 工具函数 ==========
+# ==========================================
+
+def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """
+    对输入应用 RMSNorm（与 Qwen3 模型内部归一化步骤相同）。
+    
+    Args:
+        x: 输入张量，shape (..., hidden_dim)
+        weight: RMSNorm 的 weight 参数，shape (hidden_dim,)
+        eps: 防止除零的小常数
+    
+    Returns:
+        归一化后的张量
+    """
+    variance = x.pow(2).mean(dim=-1, keepdim=True)
+    x_normed = x * torch.rsqrt(variance + eps)
+    return x_normed * weight
+
+
+def apply_rms_norm_to_all_layers(
+    flows: np.ndarray,
+    norm_weight: torch.Tensor,
+    eps: float = 1e-6,
+) -> np.ndarray:
+    """
+    对 flows 的每一层应用 RMSNorm。
+    
+    Args:
+        flows: shape (N, num_layers, hidden_dim)
+        norm_weight: RMSNorm 的 weight 参数
+        eps: 防止除零的小常数
+    
+    Returns:
+        归一化后的 flows
+    """
+    N, num_layers, hidden_dim = flows.shape
+    flows_tensor = torch.tensor(flows, dtype=torch.float32)
+    weight = norm_weight.float().cpu()
+    
+    # 对每一层应用 RMSNorm
+    flows_out = flows.copy()
+    for layer_idx in range(num_layers):
+        layer_data = flows_tensor[:, layer_idx, :]  # (N, hidden_dim)
+        normed = rms_norm(layer_data, weight, eps)
+        flows_out[:, layer_idx, :] = normed.numpy()
+    
+    return flows_out
+
+
+def get_norm_weight_from_model(model_path: str, device: torch.device) -> Tuple[torch.Tensor, float]:
+    """
+    从模型中提取 RMSNorm 的 weight 参数。
+    
+    Returns:
+        (weight, eps): norm 层的 weight 和 eps 参数
+    """
+    if not HAS_TRANSFORMERS:
+        raise RuntimeError("需要安装 transformers 库: pip install transformers")
+    
+    print(f"正在从模型 {model_path} 加载 RMSNorm 参数...")
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        device_map=device,
+        torch_dtype="auto",
+    )
+    norm_module = getattr(model.model, "norm", None)
+    if norm_module is None:
+        raise RuntimeError("Model does not have model.model.norm")
+    weight = norm_module.weight.detach().clone()
+    eps = getattr(norm_module, "variance_epsilon", getattr(norm_module, "eps", 1e-6))
+    del model
+    torch.cuda.empty_cache()
+    print(f"RMSNorm 参数加载完成，eps={eps}")
+    return weight, eps
 
 
 # ==========================================
@@ -273,6 +373,10 @@ def load_data_from_hdf5(file_path, position_select='all'):
             if 'preds' in pos_group:
                 pos_data['preds'] = list(pos_group['preds'][:].astype(str))
             
+            # 加载 true_in_carry（用于 in_carry 任务）
+            if 'true_in_carry' in pos_group:
+                pos_data['true_in_carry'] = list(pos_group['true_in_carry'][:])
+            
             all_token_results[pos] = pos_data
             print(f"    位置 {pos}: 加载完成")
     
@@ -294,7 +398,9 @@ def compute_feature_from_flow(flow, feature_type):
 
 
 def load_and_process_data(file_path, position_select='all', feature_type='flows', 
-                          pooling_type=None, use_pca=False, pca_dim=512):
+                          pooling_type=None, use_pca=False, pca_dim=512,
+                          apply_norm=False, norm_weight=None, norm_eps=1e-6,
+                          task_type='correct_or_wrong'):
     """
     加载并预处理 generate.py 输出的数据
     
@@ -315,6 +421,15 @@ def load_and_process_data(file_path, position_select='all', feature_type='flows'
             - 'max': Max Pooling
         use_pca: 是否使用PCA降维
         pca_dim: PCA降维后的维度
+        apply_norm: 是否对每一层应用 RMSNorm
+        norm_weight: RMSNorm 的 weight 参数（apply_norm=True 时需要）
+        norm_eps: RMSNorm 的 eps 参数
+        task_type: 任务类型
+            - 'correct_or_wrong': 二分类，预测模型输出是否正确
+            - 'pred_digit': 10分类，预测模型实际输出的数字
+            - 'gt_digit': 10分类，预测真实答案数字
+            - 'in_carry': 多分类，预测进位值（0-2，适用于加法）
+            - 'raw_sum': 10分类，预测该位置忽略进位的值（所有加数之和 % 10）
     
     Returns:
         X_all: 特征数据 (Tensor)
@@ -323,6 +438,9 @@ def load_and_process_data(file_path, position_select='all', feature_type='flows'
         selected_positions: 实际使用的位置列表（用于打印）
         seq_len: 序列长度
         feature_dim: 特征维度
+        gt_chars_all: 真实答案数字 (Tensor)
+        preds_all: 模型预测数字 (Tensor)
+        in_carry_all: 进位值 (Tensor)，仅当 task_type='in_carry' 或 'raw_sum' 时有效
     """
     file_path = Path(file_path)
     # 自动检测并使用最佳格式
@@ -374,6 +492,7 @@ def load_and_process_data(file_path, position_select='all', feature_type='flows'
     position_idx_list = []  # 记录每个样本来自哪个位置（索引）
     gt_chars_list = []  # 收集gt_chars
     preds_list = []     # 收集preds
+    in_carry_list = []  # 收集 true_in_carry
     pos_to_idx = {pos: i for i, pos in enumerate(selected_positions)}
     
     for pos in selected_positions:
@@ -383,9 +502,18 @@ def load_and_process_data(file_path, position_select='all', feature_type='flows'
         
         gt_chars = pos_data.get('gt_chars', [None] * len(labels))  # 获取gt_chars
         preds = pos_data.get('preds', [None] * len(labels))       # 获取preds
+        true_in_carries = pos_data.get('true_in_carry', [float('nan')] * len(labels))  # 获取 true_in_carry
         print(f"  位置 {pos}: {len(labels)} 个样本, 正样本 {sum(labels)}, 负样本 {len(labels) - sum(labels)}")
         
-        for flow, label, gt_char, pred in zip(flows, labels, gt_chars, preds):
+        for flow, label, gt_char, pred, in_carry in zip(flows, labels, gt_chars, preds, true_in_carries):
+            # 如果启用 RMSNorm，对每一层应用
+            if apply_norm and norm_weight is not None:
+                flow = apply_rms_norm_to_all_layers(
+                    flow[np.newaxis, :, :],  # 添加 batch 维度
+                    norm_weight,
+                    norm_eps
+                )[0]  # 移除 batch 维度
+            
             feat = compute_feature_from_flow(flow, feature_type)
             # feat shape: (seq_len, feature_dim) 或衍生后的 (seq_len-1, feature_dim) / (seq_len-2, feature_dim)
             
@@ -405,6 +533,15 @@ def load_and_process_data(file_path, position_select='all', feature_type='flows'
             position_idx_list.append(pos_to_idx[pos])
             gt_chars_list.append(int(gt_char) if gt_char is not None and gt_char.isdigit() else -1)
             preds_list.append(int(pred) if pred is not None and pred.isdigit() else -1)
+            # 处理 in_carry：转为整数，nan 标记为 -1
+            # NaN 出现原因：1) extra位置 2) 非加法运算 3) 数据不完整
+            try:
+                if np.isnan(in_carry):
+                    in_carry_list.append(-1)
+                else:
+                    in_carry_list.append(int(in_carry))
+            except (TypeError, ValueError):
+                in_carry_list.append(-1)
     
     # 转换为 Tensor
     X_all = torch.tensor(np.stack(X_list), dtype=torch.float32)
@@ -412,6 +549,7 @@ def load_and_process_data(file_path, position_select='all', feature_type='flows'
     position_indices = torch.tensor(position_idx_list, dtype=torch.long)
     gt_chars_all = torch.tensor(gt_chars_list, dtype=torch.long)
     preds_all = torch.tensor(preds_list, dtype=torch.long)
+    in_carry_all = torch.tensor(in_carry_list, dtype=torch.long)
     
     # 推断序列长度和特征维度（基于首个 flow 推断衍生特征形状）
     sample_flow = all_token_results[selected_positions[0]]['flows'][0]
@@ -434,6 +572,8 @@ def load_and_process_data(file_path, position_select='all', feature_type='flows'
     print(f"  处理后序列长度 (seq_len): {seq_len}")
     print(f"  特征维度 (feature_dim): {feature_dim}")
     print(f"  特征类型: {feature_type}")
+    print(f"  任务类型: {task_type}")
+    print(f"  应用RMSNorm: {apply_norm}")
     
     # PCA降维处理
     if use_pca:
@@ -448,7 +588,7 @@ def load_and_process_data(file_path, position_select='all', feature_type='flows'
         seq_len = 1
         feature_dim = pca_dim
     
-    return X_all, y_all, position_indices, selected_positions, seq_len, feature_dim, gt_chars_all, preds_all
+    return X_all, y_all, position_indices, selected_positions, seq_len, feature_dim, gt_chars_all, preds_all, in_carry_all
 
 
 def balance_dataset(X, y, position_indices):
@@ -1408,7 +1548,7 @@ def train_single_run(X_train, y_train, pos_train, X_val, y_val, pos_val, seq_len
         disagreement = sum(np.array(pred1_list) != np.array(pred2_list)) / len(pred1_list)
         print(f"{label_prefix}探针预测不一致率: {disagreement:.4f} (潜在幻觉指标)")
         
-        return (model, probe2), {"best_auc": best_avg_acc, "best_epoch": best_epoch, "val_loader": val_loader}
+        return (model, probe2), {"best_auc": best_avg_acc, "best_epoch": best_epoch, "best_acc": best_avg_acc, "val_loader": val_loader}
     
     # SpiralProbe特殊训练逻辑：训练两个探针
     if MODEL_TYPE == 'spiral_probe':
@@ -1550,7 +1690,7 @@ def train_single_run(X_train, y_train, pos_train, X_val, y_val, pos_val, seq_len
         disagreement = sum(np.array(pred1_list) != np.array(pred2_list)) / len(pred1_list)
         print(f"{label_prefix}探针预测不一致率: {disagreement:.4f} (潜在幻觉指标)")
         
-        return (model, probe2), {"best_auc": best_avg_acc, "best_epoch": best_epoch, "val_loader": val_loader}
+        return (model, probe2), {"best_auc": best_avg_acc, "best_epoch": best_epoch, "best_acc": best_avg_acc, "val_loader": val_loader}
     
     # 其他模型的正常训练流程（带验证）
     # 初始验证（随机初始化）
@@ -1565,6 +1705,7 @@ def train_single_run(X_train, y_train, pos_train, X_val, y_val, pos_val, seq_len
     best_val_auc = float("-inf")
     best_epoch = -1
     best_state = None
+    best_acc = 0.0
     no_improve_epochs = 0
     epoch = 0
     
@@ -1590,6 +1731,7 @@ def train_single_run(X_train, y_train, pos_train, X_val, y_val, pos_val, seq_len
             best_val_auc = val_metrics['auc']
             best_epoch = epoch + 1  # epoch 从 0 开始计数，这里输出 1-based
             best_state = copy.deepcopy(model.state_dict())
+            best_acc = val_metrics['acc']
             no_improve_epochs = 0
         else:
             no_improve_epochs += 1
@@ -1612,10 +1754,11 @@ def train_single_run(X_train, y_train, pos_train, X_val, y_val, pos_val, seq_len
     if best_state is not None:
         model.load_state_dict(best_state)
 
-    print(f"{label_prefix}训练完成! 最佳验证AUC: {best_val_auc:.4f} (Epoch {best_epoch})")
+    print(f"{label_prefix}训练完成! 最佳验证AUC: {best_val_auc:.4f}  | 对应Acc: {best_acc:.4f} (Epoch {best_epoch})")
     return model, {
         "best_auc": best_val_auc,
         "best_epoch": best_epoch,
+        "best_acc": best_acc,
         "val_loader": val_loader  # 便于后续位置统计
     }
 
@@ -1627,6 +1770,26 @@ def train_single_run(X_train, y_train, pos_train, X_val, y_val, pos_val, seq_len
 def main():
     training_executed = False  # 用于 parallel_runner 下判断是否真正训练
     setup_logger()
+
+    parser = argparse.ArgumentParser(description="Classifier runner")
+    parser.add_argument("--task-type", choices=["correct_or_wrong", "pred_digit", "gt_digit", "in_carry", "raw_sum"], default=None, help="Override TASK_TYPE")
+    parser.add_argument("--model-type", choices=["mlp", "mlp10", "transformer", "logreg", "ar_transformer", "lstm", "circular_probe", "spiral_probe", "cnn", "cnn2d", "svm"], default=None, help="Override MODEL_TYPE")
+    parser.add_argument("--eval-each-layer", action="store_true", help="Enable evaluate-each-layer")
+    parser.add_argument("--no-eval-each-layer", action="store_true", help="Disable evaluate-each-layer")
+    args = parser.parse_args()
+
+    # 覆盖全局配置
+    global TASK_TYPE, MODEL_TYPE, EVALUATE_EACH_LAYER
+    if args.task_type:
+        TASK_TYPE = args.task_type
+    if args.model_type:
+        MODEL_TYPE = args.model_type
+    if args.eval_each_layer and args.no_eval_each_layer:
+        raise ValueError("--eval-each-layer 与 --no-eval-each-layer 互斥")
+    if args.eval_each_layer:
+        EVALUATE_EACH_LAYER = True
+    if args.no_eval_each_layer:
+        EVALUATE_EACH_LAYER = False
     
     pooling_type = POOLING_TYPE
     # CNN2D 需要保持原始形状，不能使用 pooling
@@ -1646,6 +1809,8 @@ def main():
     print(f"  特征类型: {FEATURE_TYPE}")
     print(f"  Pooling类型: {pooling_type}")
     print(f"  模型类型: {MODEL_TYPE}")
+    print(f"  任务类型: {TASK_TYPE}")
+    print(f"  应用RMSNorm: {APPLY_NORM}")
     print(f"  早停耐心: {EARLY_STOP_PATIENCE}")
     print(f"  数据平衡: {BALANCE_DATASET}")
     print(f"  按位置强平衡: {STRONG_BALANCE_BY_POSITION}")
@@ -1654,32 +1819,104 @@ def main():
     print(f"  按位置评估: {EVALUATE_EACH_POSITION}")
     print("=" * 60)
     
+    # 加载 RMSNorm 参数（如果需要）
+    norm_weight = None
+    norm_eps = 1e-6
+    if APPLY_NORM:
+        if not HAS_TRANSFORMERS:
+            raise RuntimeError("启用 RMSNorm 需要安装 transformers 库: pip install transformers")
+        norm_weight, norm_eps = get_norm_weight_from_model(NORM_MODEL_PATH, DEVICE)
+    
     # 加载数据
-    X_all, y_all, position_indices, selected_positions, seq_len, feature_dim, gt_chars_all, preds_all = load_and_process_data(
+    X_all, y_all, position_indices, selected_positions, seq_len, feature_dim, gt_chars_all, preds_all, in_carry_all = load_and_process_data(
         DATA_FILE_PATH,
         position_select=POSITION_SELECT,
         feature_type=FEATURE_TYPE,
         pooling_type=pooling_type,
         use_pca=USE_PCA,
-        pca_dim=PCA_DIM
+        pca_dim=PCA_DIM,
+        apply_norm=APPLY_NORM,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
+        task_type=TASK_TYPE
     )
     
-    # 若为10类MLP，使用数据中的 gt_chars 作为标签，并过滤无效样本
-    if MODEL_TYPE == 'mlp10':
-        print("使用10类MLP：标签采用数据文件中的 gt_chars (0-9)")
+    # 根据任务类型设置标签
+    if TASK_TYPE == 'correct_or_wrong':
+        # 二分类：已在 load_and_process_data 中处理（y_list.append(0 if label else 1)）
+        num_classes = 2
+        print(f"任务类型: correct_or_wrong（二分类）")
+    elif TASK_TYPE == 'pred_digit':
+        # 10分类：预测模型输出的数字
+        print(f"任务类型: pred_digit（预测模型输出数字，10分类）")
+        valid_mask = (preds_all >= 0) & (preds_all < 10)
+        kept = int(valid_mask.sum().item())
+        dropped = int((~valid_mask).sum().item())
+        if dropped > 0:
+            print(f"  过滤无效样本: 保留 {kept}，舍弃 {dropped}（preds为-1或不在0-9）")
+        X_all = X_all[valid_mask]
+        y_all = preds_all[valid_mask]
+        position_indices = position_indices[valid_mask]
+        gt_chars_all = gt_chars_all[valid_mask]
+        preds_all = preds_all[valid_mask]
+        in_carry_all = in_carry_all[valid_mask]
+        num_classes = 10
+    elif TASK_TYPE == 'gt_digit':
+        # 10分类：预测真实答案数字
+        print(f"任务类型: gt_digit（预测真实答案数字，10分类）")
         valid_mask = (gt_chars_all >= 0) & (gt_chars_all < 10)
         kept = int(valid_mask.sum().item())
         dropped = int((~valid_mask).sum().item())
         if dropped > 0:
-            print(f"  过滤无效标签样本: 保留 {kept}，舍弃 {dropped}（gt_chars为-1或不在0-9）")
+            print(f"  过滤无效样本: 保留 {kept}，舍弃 {dropped}（gt_chars为-1或不在0-9）")
         X_all = X_all[valid_mask]
         y_all = gt_chars_all[valid_mask]
         position_indices = position_indices[valid_mask]
         gt_chars_all = gt_chars_all[valid_mask]
         preds_all = preds_all[valid_mask]
+        in_carry_all = in_carry_all[valid_mask]
+        num_classes = 10
+    elif TASK_TYPE == 'in_carry':
+        # 多分类：预测进位值（0, 1, 2）
+        print(f"任务类型: in_carry（预测进位值，多分类）")
+        valid_mask = (in_carry_all >= 0)
+        kept = int(valid_mask.sum().item())
+        dropped = int((~valid_mask).sum().item())
+        if dropped > 0:
+            print(f"  过滤无效样本: 保留 {kept}，舍弃 {dropped}（in_carry为-1/nan）")
+        X_all = X_all[valid_mask]
+        y_all = in_carry_all[valid_mask]
+        position_indices = position_indices[valid_mask]
+        gt_chars_all = gt_chars_all[valid_mask]
+        preds_all = preds_all[valid_mask]
+        in_carry_all = in_carry_all[valid_mask]
+        num_classes = int(y_all.max().item()) + 1
+        print(f"  进位值范围: 0-{num_classes - 1}，共 {num_classes} 个类别")
+    elif TASK_TYPE == 'raw_sum':
+        # 10分类：预测忽略进位的个位值 = (所有加数之和 % 10)
+        # 数学关系：gt_digit = (raw_sum + in_carry) % 10 → raw_sum % 10 = (gt_digit - in_carry) % 10
+        print(f"任务类型: raw_sum（预测忽略进位的值 = 和的个位，10分类）")
+        # 需要同时拥有有效的 gt_digit 与 in_carry
+        valid_mask = (gt_chars_all >= 0) & (gt_chars_all < 10) & (in_carry_all >= 0)
+        kept = int(valid_mask.sum().item())
+        dropped = int((~valid_mask).sum().item())
+        if dropped > 0:
+            print(f"  过滤无效样本: 保留 {kept}，舍弃 {dropped}（缺少 gt_digit 或 in_carry）")
+        X_all = X_all[valid_mask]
+        gt_chars_all = gt_chars_all[valid_mask]
+        in_carry_all = in_carry_all[valid_mask]
+        position_indices = position_indices[valid_mask]
+        preds_all = preds_all[valid_mask]
+        # 原始和的个位（忽略进位）
+        raw_mod = (gt_chars_all - in_carry_all) % 10
+        y_all = raw_mod
+        num_classes = 10
+    else:
+        raise ValueError(f"不支持的任务类型: {TASK_TYPE}")
     
     # 数据平衡（仅适用于二分类）。多分类时跳过。
-    if MODEL_TYPE != 'mlp10':
+    is_binary_task = TASK_TYPE == 'correct_or_wrong'
+    if is_binary_task:
         if STRONG_BALANCE_BY_POSITION:
             X_all, y_all, position_indices = balance_dataset_per_position(
                 X_all, y_all, position_indices, position_names=selected_positions
@@ -1688,7 +1925,7 @@ def main():
             X_all, y_all, position_indices = balance_dataset(X_all, y_all, position_indices)
     else:
         if STRONG_BALANCE_BY_POSITION or BALANCE_DATASET:
-            print("提示: mlp10 为多分类任务，已跳过二分类的平衡步骤。")
+            print("提示: 多分类任务，已跳过二分类的平衡步骤。")
     
     # 数据划分
     indices = np.arange(len(X_all))
@@ -1811,9 +2048,19 @@ def main():
                 elif len(np.unique(y_true)) < 2:
                     print(f"  位置 {pos}: 仅有一种标签，无法计算AUC")
                 else:
-                    if MODEL_TYPE == 'mlp10':
-                        # 多分类：macro OVR AUC
-                        auc = roc_auc_score(y_true, y_score, multi_class='ovr')
+                    if y_score.ndim > 1 and y_score.shape[1] > 2:
+                        # 多分类：仅使用出现过的标签对应的列，并重新归一化到概率
+                        labels_used = np.unique(y_true)
+                        labels_sorted = np.sort(labels_used)
+                        y_score_subset = y_score[:, labels_sorted]
+                        row_sum = y_score_subset.sum(axis=1, keepdims=True)
+                        zero_mask = row_sum.squeeze() == 0
+                        if np.any(zero_mask):
+                            # 避免除零：为零行赋均匀概率
+                            y_score_subset[zero_mask] = 1.0 / len(labels_sorted)
+                            row_sum = y_score_subset.sum(axis=1, keepdims=True)
+                        y_score_norm = y_score_subset / row_sum
+                        auc = roc_auc_score(y_true, y_score_norm, labels=labels_sorted, multi_class='ovr')
                     else:
                         auc = roc_auc_score(y_true, y_score)
                     print(f"  位置 {pos}: 验证AUC {auc:.4f} (样本数 {len(y_true)})")
@@ -1827,10 +2074,20 @@ def main():
                 all_probs.extend(per_pos_probs[idx])
             
             if len(all_labels) > 0 and len(np.unique(all_labels)) >= 2:
-                if MODEL_TYPE == 'mlp10':
-                    overall_auc = roc_auc_score(all_labels, np.array(all_probs), multi_class='ovr')
+                all_probs_arr = np.array(all_probs)
+                if all_probs_arr.ndim > 1 and all_probs_arr.shape[1] > 2:
+                    labels_used = np.unique(all_labels)
+                    labels_sorted = np.sort(labels_used)
+                    all_probs_subset = all_probs_arr[:, labels_sorted]
+                    row_sum = all_probs_subset.sum(axis=1, keepdims=True)
+                    zero_mask = row_sum.squeeze() == 0
+                    if np.any(zero_mask):
+                        all_probs_subset[zero_mask] = 1.0 / len(labels_sorted)
+                        row_sum = all_probs_subset.sum(axis=1, keepdims=True)
+                    all_probs_norm = all_probs_subset / row_sum
+                    overall_auc = roc_auc_score(all_labels, all_probs_norm, labels=labels_sorted, multi_class='ovr')
                 else:
-                    overall_auc = roc_auc_score(all_labels, all_probs)
+                    overall_auc = roc_auc_score(all_labels, all_probs_arr)
                 print(f"\n  总体验证AUC: {overall_auc:.4f} (总样本数 {len(all_labels)})")
     elif EVALUATE_EACH_POSITION and not EVALUATE_EACH_LAYER:
         # 按位置评估
@@ -1889,17 +2146,18 @@ def main():
                 "position": pos,
                 "position_idx": pos_idx,
                 "best_auc": result["best_auc"],
-                "best_epoch": result["best_epoch"]
+                "best_epoch": result["best_epoch"],
+                "best_acc": result.get("best_acc", float('nan'))
             })
         
         print(f"\n{'='*60}")
         print("按位置评估结果汇总（按 AUC 降序）：")
         position_results_sorted = sorted(position_results, key=lambda x: x["best_auc"], reverse=True)
         for item in position_results_sorted:
-            print(f"  位置 {item['position']}: 最佳 AUC = {item['best_auc']:.4f} (Epoch {item['best_epoch']})")
+            print(f"  位置 {item['position']}: 最佳 AUC = {item['best_auc']:.4f} (Epoch {item['best_epoch']}) | 对应Acc: {item['best_acc']:.4f}")
         if position_results_sorted:
             best_pos = position_results_sorted[0]
-            print(f"\n最佳位置: {best_pos['position']}，最佳验证 AUC: {best_pos['best_auc']:.4f} (Epoch {best_pos['best_epoch']})")
+            print(f"\n最佳位置: {best_pos['position']}，最佳验证 AUC: {best_pos['best_auc']:.4f} (Epoch {best_pos['best_epoch']}) | 对应Acc: {best_pos['best_acc']:.4f}")
     
     else:
         # 按层评估（可与按位置评估组合）
@@ -1936,17 +2194,18 @@ def main():
                 layer_results.append({
                     "layer": layer_idx,
                     "best_auc": result["best_auc"],
-                    "best_epoch": result["best_epoch"]
+                    "best_epoch": result["best_epoch"],
+                    "best_acc": result.get("best_acc", float('nan'))
                 })
             
             print(f"\n{'='*60}")
             print("按层评估结果汇总（按 AUC 降序）：")
             layer_results_sorted = sorted(layer_results, key=lambda x: x["best_auc"], reverse=True)
             for item in layer_results_sorted:
-                print(f"  层 {item['layer']:>2}: 最佳 AUC = {item['best_auc']:.4f} (Epoch {item['best_epoch']})")
+                print(f"  层 {item['layer']:>2}: 最佳 AUC = {item['best_auc']:.4f} (Epoch {item['best_epoch']}) | 对应Acc: {item['best_acc']:.4f}")
             if layer_results_sorted:
                 best_layer = layer_results_sorted[0]
-                print(f"\n最佳层: {best_layer['layer']}，最佳验证 AUC: {best_layer['best_auc']:.4f} (Epoch {best_layer['best_epoch']})")
+                print(f"\n最佳层: {best_layer['layer']}，最佳验证 AUC: {best_layer['best_auc']:.4f} (Epoch {best_layer['best_epoch']}) | 对应Acc: {best_layer['best_acc']:.4f}")
         else:
             # 按位置 + 按层
             pos_layer_results = []
@@ -2007,7 +2266,8 @@ def main():
                         "position_idx": pos_idx,
                         "layer": layer_idx,
                         "best_auc": result["best_auc"],
-                        "best_epoch": result["best_epoch"]
+                        "best_epoch": result["best_epoch"],
+                        "best_acc": result.get("best_acc", float('nan'))
                     })
             
             print(f"\n{'='*60}")
@@ -2020,9 +2280,9 @@ def main():
                 pos_results_sorted = sorted(pos_results, key=lambda x: x["best_auc"], reverse=True)
                 print(f"\n位置 {pos}:")
                 for item in pos_results_sorted:
-                    print(f"  层 {item['layer']:>2}: 最佳 AUC = {item['best_auc']:.4f} (Epoch {item['best_epoch']})")
+                    print(f"  层 {item['layer']:>2}: 最佳 AUC = {item['best_auc']:.4f} (Epoch {item['best_epoch']}) | 对应Acc: {item['best_acc']:.4f}")
                 best_item = pos_results_sorted[0]
-                print(f"  最佳层: {best_item['layer']}，最佳验证 AUC: {best_item['best_auc']:.4f} (Epoch {best_item['best_epoch']})")
+                print(f"  最佳层: {best_item['layer']}，最佳验证 AUC: {best_item['best_auc']:.4f} (Epoch {best_item['best_epoch']}) | 对应Acc: {best_item['best_acc']:.4f}")
 
     # parallel_runner 环境下，若未进行训练（全部因样本不足等被跳过），删除空日志文件
     if os.getenv("PARALLEL_RUNNER") == "1" and not training_executed:

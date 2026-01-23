@@ -2,5 +2,5 @@ log/
 __pycache__/
 results/
 saved_models/
-plot_auc.py
+run_batch.py
 test.py
