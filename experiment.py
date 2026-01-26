@@ -191,7 +191,7 @@ def main():
     parser.add_argument("--layers", type=int, nargs="*", default=None)
     parser.add_argument("--lambda-grid", type=str, default="0.0,0.25,0.5,0.75,1.0")
     parser.add_argument("--out-dir", type=Path, default=Path("VerticalFlow/log/log_experiments"))
-    parser.add_argument("--force-script", type=Path, default=Path("VerticalFlow/force_probe.py"))
+    parser.add_argument("--force-script", type=Path, default=Path("VerticalFlow/dualstream_probe.py"))
     parser.add_argument("--linear-script", type=Path, default=Path("VerticalFlow/linear_probe.py"))
     parser.add_argument("--mlp-script", type=Path, default=Path("VerticalFlow/mlp_probe.py"))
     parser.add_argument("--skip-orig", action="store_true", help="Skip original acc and SPI computations")
@@ -349,7 +349,7 @@ def main():
             run_script(cmd)
             corrected_metrics = load_json(out_path)
         elif method == "force":
-            out_path = args.out_dir / "force_probe.json"
+            out_path = args.out_dir / "dualstream_probe.json"
             cmd = [
                 sys.executable,
                 str(args.force_script),

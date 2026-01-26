@@ -31,7 +31,7 @@ MODEL_NAME = "/data/Models/Qwen3-4b"
 # DATA_PATH = '/home/wenliuyuan/llm/vertical-flow/dataset/num2len10-10000.pkl'
 # DATA_PATH = '/home/wenliuyuan/llm/vertical-flow/dataset/num3len3-10000.pkl'
 # DATA_PATH = '/home/wenliuyuan/llm/vertical-flow/dataset/num3len10-10000.pkl'
-DATA_PATH = 'VerticalFlow/num3len10-10000.pkl'
+DATA_PATH = 'VerticalFlow/num4len10-20000.pkl'
 
 # 运算符配置
 SIGN = 'plus'  # 'plus', 'mul', 'sub', 'div'
@@ -42,7 +42,7 @@ MAX_NEW_TOKENS = 25
 # 开关：是否check所有tokens
 # True: 每个token都判断并存储
 # False: 只check到第一个错误的token，记录后就停止（但如果全对，还会check后面一位）
-CHECK_ALL_TOKENS = True
+CHECK_ALL_TOKENS = False
 
 # 每处理多少个样本保存一次结果
 SAVE_INTERVAL = 200

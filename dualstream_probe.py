@@ -956,7 +956,7 @@ def main():
     raw_tag = "auto" if layer_pair[0] is None else str(layer_pair[0])
     inertia_tag = "auto" if layer_pair[1] is None else str(layer_pair[1])
     ckpt_name = (
-        f"force_probe_{args.h5.stem}_pos{_positions_tag(args.positions)}_"
+        f"dualstream_probe_{args.h5.stem}_pos{_positions_tag(args.positions)}_"
         f"raw{raw_tag}_in{inertia_tag}_ptype{args.probe_type}_"
         f"sf{args.sample_filter}_seed{args.seed}_"
         f"tr{args.train_ratio}_vr{args.val_ratio}_te{args.test_ratio}.pt"
