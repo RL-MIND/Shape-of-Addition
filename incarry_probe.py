@@ -19,7 +19,7 @@ except ImportError as exc:  # pragma: no cover
 
 # Default configuration
 DEFAULT_DATA_PATH = Path(
-    "VerticalFlow/results/plus_num3len10_Qwen3-4b/plus_num3len10_Qwen3-4b.h5"
+    "results/plus_num3len10_Qwen3-4b/plus_num3len10_Qwen3-4b.h5"
 )
 DEFAULT_PROBE_TYPE = "mlp"  # choices: linear, mlp, circular
 DEFAULT_BATCH_SIZE = 256
@@ -30,8 +30,8 @@ DEFAULT_MAX_EPOCHS = 200
 DEFAULT_TEST_SIZE = 0.1
 DEFAULT_SEED = 42
 
-LOG_DIR = Path("VerticalFlow/log/log_incarry")
-SAVE_DIR = Path("VerticalFlow/saved_models")
+LOG_DIR = Path("log/log_incarry")
+SAVE_DIR = Path("saved_models")
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -596,3 +596,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

@@ -227,6 +227,19 @@ def build_flat_dataset(
     )
 
 
+def select_test_subset(
+    gt_digits: np.ndarray,
+    pred_digits: np.ndarray,
+    sample_ids: np.ndarray,
+    test_ids: set[int],
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    test_mask = np.isin(sample_ids, list(test_ids)) if test_ids else np.zeros_like(sample_ids, dtype=bool)
+    gt_test = gt_digits[test_mask] if test_mask.any() else gt_digits
+    pred_test = pred_digits[test_mask] if test_mask.any() else pred_digits
+    sample_ids_test = sample_ids[test_mask] if test_mask.any() else sample_ids
+    return gt_test, pred_test, sample_ids_test, test_mask
+
+
 def split_sample_ids(
     sample_ids: np.ndarray,
     train_ratio: float,
@@ -282,3 +295,51 @@ def compute_token_sample_acc(
             correct_samples += 1
     sample_acc = correct_samples / len(unique_samples) if len(unique_samples) else 0.0
     return token_acc, sample_acc
+
+
+def load_h5_baseline_metrics(
+    h5_path: Path,
+    dataset_path: Path,
+    positions: List[int] | None,
+    train_ratio: float,
+    val_ratio: float,
+    test_ratio: float,
+    seed: int,
+) -> Tuple[Dict[str, float], Dict[str, np.ndarray]]:
+    dataset_full = load_dataset(dataset_path)
+    positions_data = load_positions(h5_path)
+    _, _, _, gt_digits, pred_digits, sample_ids, _ = build_flat_dataset(
+        dataset_full,
+        positions_data,
+        positions_filter=positions,
+    )
+
+    _, _, test_ids = split_sample_ids(
+        sample_ids,
+        train_ratio=train_ratio,
+        val_ratio=val_ratio,
+        test_ratio=test_ratio,
+        seed=seed,
+    )
+    gt_test, pred_test, sample_ids_test, test_mask = select_test_subset(
+        gt_digits,
+        pred_digits,
+        sample_ids,
+        test_ids,
+    )
+    token_acc, sample_acc = compute_token_sample_acc(pred_test, gt_test, sample_ids_test)
+
+    metrics = {
+        "orig_h5_token_acc": float(token_acc),
+        "orig_h5_sample_acc": float(sample_acc),
+        "test_tokens": int(len(gt_test)),
+        "test_samples": int(len(np.unique(sample_ids_test))),
+    }
+    arrays = {
+        "gt_test": gt_test,
+        "pred_test": pred_test,
+        "sample_ids_test": sample_ids_test,
+        "test_mask": test_mask,
+        "test_ids": test_ids,
+    }
+    return metrics, arrays

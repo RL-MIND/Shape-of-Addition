@@ -11,6 +11,8 @@ from datetime import datetime
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM, Qwen3ForCausalLM
 
+from model_utils import apply_chat_template_safe, detect_model_type, setup_prenorm_hook, get_norm_module
+
 
 # ===========================
 # 配置参数
@@ -20,10 +22,12 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, Qwen3ForCausalLM
 DEVICE = 'auto'
 
 # 模型路径
-# MODEL_NAME = "/data0/wenliuyuan/models/Qwen3-0.6B"
-MODEL_NAME = "/data/Models/Qwen3-4b"
-# MODEL_NAME = "/data0/wenliuyuan/models/Qwen3-8B"
-# MODEL_NAME = "/data0/wenliuyuan/models/Qwen3-30B-A3B-Instruct-2507"
+# MODEL_NAME = "/data/Models/Qwen3-4b"
+
+MODEL_NAME = "/data/wenliuyuan/models/Qwen3-8B"
+# MODEL_NAME = "/data/wenliuyuan/models/phi-3-mini-4k-instruct"
+# MODEL_NAME = "/data/wenliuyuan/models/gemma-3-4b-it"
+
 
 # 数据集路径
 # DATA_PATH = '/home/wenliuyuan/llm/vertical-flow/dataset/num2len2-10000.pkl'
@@ -31,7 +35,7 @@ MODEL_NAME = "/data/Models/Qwen3-4b"
 # DATA_PATH = '/home/wenliuyuan/llm/vertical-flow/dataset/num2len10-10000.pkl'
 # DATA_PATH = '/home/wenliuyuan/llm/vertical-flow/dataset/num3len3-10000.pkl'
 # DATA_PATH = '/home/wenliuyuan/llm/vertical-flow/dataset/num3len10-10000.pkl'
-DATA_PATH = 'VerticalFlow/num4len10-20000.pkl'
+DATA_PATH = 'num3len12-100000.pkl'
 
 # 运算符配置
 SIGN = 'plus'  # 'plus', 'mul', 'sub', 'div'
@@ -42,7 +46,10 @@ MAX_NEW_TOKENS = 25
 # 开关：是否check所有tokens
 # True: 每个token都判断并存储
 # False: 只check到第一个错误的token，记录后就停止（但如果全对，还会check后面一位）
-CHECK_ALL_TOKENS = False
+CHECK_ALL_TOKENS = True
+
+# 最大处理样本数限制（本次运行最多处理的样本数）
+SAMPLES_LIMIT = 10000
 
 # 每处理多少个样本保存一次结果
 SAVE_INTERVAL = 200
@@ -52,14 +59,14 @@ OUTPUT_BACKEND = "hdf5"  # 默认增量写 HDF5，兼容需要时可改为 'pick
 
 # 结果保存路径（按后端）
 suffix = "_paritial" if not CHECK_ALL_TOKENS else ""
-RESULTS_PATH_PKL = "VerticalFlow/results/" + SIGN + "_" + DATA_PATH.split("/")[-1].split(".")[0].split("-")[0] + "_" + MODEL_NAME.split("/")[-1] + suffix + ".pkl"
-RESULTS_PATH_H5 = "VerticalFlow/results/" + SIGN + "_" + DATA_PATH.split("/")[-1].split(".")[0].split("-")[0] + "_" + MODEL_NAME.split("/")[-1] + suffix +"/"+ SIGN + "_" + DATA_PATH.split("/")[-1].split(".")[0].split("-")[0] + "_" + MODEL_NAME.split("/")[-1] + suffix + ".h5"
+RESULTS_PATH_PKL = "results/" + SIGN + "_" + DATA_PATH.split("/")[-1].split(".")[0].split("-")[0] + "_" + MODEL_NAME.split("/")[-1] + suffix + ".pkl"
+RESULTS_PATH_H5 = "results/" + SIGN + "_" + DATA_PATH.split("/")[-1].split(".")[0].split("-")[0] + "_" + MODEL_NAME.split("/")[-1] + suffix +"/"+ SIGN + "_" + DATA_PATH.split("/")[-1].split(".")[0].split("-")[0] + "_" + MODEL_NAME.split("/")[-1] + suffix + ".h5"
 
 # 是否在使用 HDF5 时额外导出最终 pickle（可能占用大量内存/磁盘）
 ENABLE_FINAL_PICKLE_EXPORT = False
 
 # 日志目录
-LOG_DIR = "./VerticalFlow/log/log_generate"
+LOG_DIR = "./log/log_generate"
 
 
 # ===========================
@@ -155,12 +162,22 @@ def calculate_logit_diff(hidden_state, lm_head, true_logits, norm_layer=None):
     diff = (computed_logits.to("cpu") - true_logits.to("cpu")).abs().max().item()
     return diff
 
-def analyze_model_layers(model, tokenizer):
+def analyze_model_layers(model, tokenizer, model_type=None):
     """
     遍历模型每一层，分析 hidden_states 输出的状态（是否已 Normalized）。
     返回最后一层是否 Normalized 的结论。
+    
+    Args:
+        model: 语言模型实例
+        tokenizer: tokenizer 实例
+        model_type: 模型类型（'qwen' 或 'phi3'），如果为 None 则自动检测
     """
     print(f"\n{'='*80}\n分析模型各层 Hidden States 输出状态\n{'='*80}")
+    
+    if model_type is None:
+        model_type = detect_model_type(model.config.model_type if hasattr(model.config, 'model_type') else "qwen")
+    
+    print(f"检测到模型类型: {model_type}")
     
     prompt = "1 + 1 = "
     inputs = tokenizer(prompt, return_tensors='pt').to(model.device)
@@ -172,7 +189,7 @@ def analyze_model_layers(model, tokenizer):
         hidden_states = outputs.hidden_states
     
     lm_head = model.lm_head
-    norm = model.model.norm
+    norm = get_norm_module(model)
     
     print(f"{'Layer':<6} | {'Diff (No Norm)':<15} | {'Diff (With Norm)':<15} | {'RMS':<10} | {'Conclusion'}")
     print("-" * 80)
@@ -746,6 +763,7 @@ def main():
     logger.info(f"  SIGN: {SIGN}")
     logger.info(f"  MAX_NEW_TOKENS: {MAX_NEW_TOKENS}")
     logger.info(f"  CHECK_ALL_TOKENS: {CHECK_ALL_TOKENS}")
+    logger.info(f"  SAMPLES_LIMIT: {SAMPLES_LIMIT}")
     logger.info(f"  SAVE_INTERVAL: {SAVE_INTERVAL}")
     logger.info("=" * 50)
     
@@ -765,8 +783,12 @@ def main():
     )
     logger.info("模型加载完成")
     
+    # 检测模型类型
+    model_type = detect_model_type(MODEL_NAME)
+    logger.info(f"检测到模型类型: {model_type}")
+    
     # 验证是否需要 Hook
-    last_layer_normalized = analyze_model_layers(model, tokenizer)
+    last_layer_normalized = analyze_model_layers(model, tokenizer, model_type)
     logger.info(f"模型最后一层检测结果: {'ALREADY NORMALIZED' if last_layer_normalized else 'NEEDS NORM'}")
     
     CAPTURED_PRENORM_STATES = []
@@ -774,12 +796,7 @@ def main():
     
     if last_layer_normalized:
         logger.info(">>> 启用 Pre-Norm Hook 捕获")
-        def prenorm_hook(module, args, output):
-            # args[0] is input to norm layer (pre-norm hidden states)
-            # 及时移至 CPU 节省显存
-            CAPTURED_PRENORM_STATES.append(args[0].detach().cpu()) 
-            
-        hook_handle = model.model.norm.register_forward_hook(prenorm_hook)
+        CAPTURED_PRENORM_STATES, hook_handle = setup_prenorm_hook(model)
     else:
         logger.info(">>> 无需 Hook (直接使用 output_hidden_states)")
     
@@ -834,9 +851,14 @@ def main():
         else:
             logger.info("检测到 HDF5 文件但未能获取有效进度，将从头开始。")
     
+    # 计算本次处理范围
+    process_count = min(SAMPLES_LIMIT, len(dataset) - start_idx)
+    end_idx = start_idx + process_count
+    logger.info(f"起始样本索引: {start_idx}, 本次计划处理: {process_count}, 结束索引: {end_idx}")
+    
     # 主循环
     logger.info("\n开始处理...")
-    for data_idx in range(start_idx, len(dataset)):
+    for data_idx in range(start_idx, end_idx):
         data_item = dataset[data_idx]
         logger.info(f"Sample {data_idx}")
         operands = parse_operands(data_item, data_idx)
@@ -846,12 +868,7 @@ def main():
         # 构建输入
         prompt = f"Calculate {expr}. Only output a number."
         messages = [{"role": "user", "content": prompt}]
-        text = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=False
-        )
+        text = apply_chat_template_safe(tokenizer, messages, model_type)
         text = text + expr + " = "
         
         # 生成

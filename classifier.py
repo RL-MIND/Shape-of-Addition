@@ -38,20 +38,20 @@ except ImportError:
 # ==========================================
 
 # 日志配置
-LOG_DIR = Path("VerticalFlow/log/log_classify")
+LOG_DIR = Path("log/log_classify")
 LOGGER = None  # 运行时在 main 中初始化
 ORIGINAL_PRINT = print
 
 # --- 1. 数据配置 ---
 # DATA_FILE_PATH = 'results/results-Qwen3-0p6B'
-DATA_FILE_PATH = 'VerticalFlow/results/plus_num4len10_Qwen3-4b_paritial/plus_num4len10_Qwen3-4b_paritial'
-# DATA_FILE_PATH = 'VerticalFlow/results/mul_num2len5_Qwen3-4b/mul_num2len5_Qwen3-4b'
+DATA_FILE_PATH = 'results/plus_num4len10_Qwen3-4b_paritial/plus_num4len10_Qwen3-4b_paritial'
+# DATA_FILE_PATH = 'results/mul_num2len5_Qwen3-4b/mul_num2len5_Qwen3-4b'
 # DATA_FILE_PATH = 'results/mul_num3len3_Qwen3-4B-Instruct-2507'
 # DATA_FILE_PATH = 'results/plus_num3len10_Qwen3-4B-Instruct-2507'
 # DATA_FILE_PATH = 'results/plus_num5len20_Qwen3-4B-Instruct-2507'
 
 # 可选：用于 c_potential 标签计算的数据集（与 dualstream_probe 一致，pickle 列表，每项是操作数列表）
-C_POTENTIAL_DATASET_PATH = 'VerticalFlow/num3len10-10000.pkl'  # 例如 'VerticalFlow/num3len10-10000.pkl'
+C_POTENTIAL_DATASET_PATH = 'num3len10-10000.pkl'  # 例如 'num3len10-10000.pkl'
 
 BALANCE_DATASET = False           # [Deprecated for multi-class] 仅用于旧逻辑的二分类平衡
 BALANCE_BY_CLASS = False          # 新选项：按任务标签类别进行平衡（适用于二分类/多分类）
@@ -115,7 +115,7 @@ MODEL_TYPE = 'mlp'
 
 # --- 3.1 模型存储 ---
 SAVE_MODEL = False               # 是否在训练结束后保存模型
-SAVE_DIR = 'VerticalFlow/saved_models'        # 模型保存目录
+SAVE_DIR = 'saved_models'        # 模型保存目录
 SAVE_NAME = DATA_FILE_PATH.split('/')[-1]
 
 # --- 4. MLP模型参数 ---

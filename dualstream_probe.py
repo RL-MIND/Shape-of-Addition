@@ -1,5 +1,6 @@
 import argparse
 import copy
+from datetime import datetime
 import json
 import math
 from pathlib import Path
@@ -10,13 +11,21 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from model_utils import apply_chat_template_safe, detect_model_type, get_norm_weight_from_model, setup_prenorm_hook, rms_norm, analyze_last_layer_normalized
 
 from probe_data import (
     build_flat_dataset,
     compute_token_sample_acc,
     load_dataset,
+    load_h5_baseline_metrics,
     load_positions,
     split_sample_ids,
+)
+from probe_utils import (
+    get_digit_token_ids as shared_get_digit_token_ids,
+    load_or_compute_teacher_features,
+    online_baseline_eval,
+    teacher_force_extract as shared_teacher_force_extract,
 )
 from verify import (
     build_dirs_cross_digit,
@@ -502,22 +511,10 @@ def evaluate_correction_vector_steer(
 
 
 def get_digit_token_ids(tokenizer: AutoTokenizer) -> Tuple[List[int], List[int]]:
-    digit_ids = {}
-    for d in range(10):
-        ids = tokenizer.encode(str(d), add_special_tokens=False)
-        if len(ids) != 1:
-            raise ValueError(f"Digit {d} is not a single token: {ids}")
-        digit_ids[d] = ids[0]
-    digit_id_list = [digit_ids[d] for d in sorted(digit_ids.keys())]
-    digit_val_list = sorted(digit_ids.keys())
-    return digit_id_list, digit_val_list
+    return shared_get_digit_token_ids(tokenizer)
 
 
-def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """对输入应用 RMSNorm。"""
-    variance = x.pow(2).mean(dim=-1, keepdim=True)
-    x_normed = x * torch.rsqrt(variance + eps)
-    return x_normed * weight
+    
 
 
 def apply_rms_norm_to_flows(
@@ -525,31 +522,77 @@ def apply_rms_norm_to_flows(
     norm_weight: torch.Tensor,
     layer_idx: int,
     eps: float = 1e-6,
+    add_unit_offset: bool = False,
 ) -> np.ndarray:
     """对 flows 指定层应用 RMSNorm。"""
     flows_tensor = torch.tensor(flows[:, layer_idx, :], dtype=torch.float32)
     weight = norm_weight.float().cpu()
-    normed = rms_norm(flows_tensor, weight, eps)
+    normed = rms_norm(flows_tensor, weight, eps, add_unit_offset=add_unit_offset)
     flows_out = flows.copy()
     flows_out[:, layer_idx, :] = normed.numpy()
     return flows_out
 
 
-def get_norm_weight_from_model(model_path: str, device: torch.device) -> Tuple[torch.Tensor, float]:
-    """从模型中提取 RMSNorm 的 weight 参数。"""
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        device_map=device,
-        torch_dtype="auto",
+def teacher_force_extract(
+    dataset: List[List[int]],
+    tokenizer: AutoTokenizer,
+    model: AutoModelForCausalLM,
+    max_new_tokens: int,
+    device: torch.device,
+    use_prenorm: bool = False,
+    valid_indices: Optional[set[int]] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    return shared_teacher_force_extract(
+        dataset,
+        tokenizer,
+        model,
+        max_new_tokens,
+        device,
+        use_prenorm=use_prenorm,
+        valid_indices=valid_indices,
     )
-    norm_module = getattr(model.model, "norm", None)
-    if norm_module is None:
-        raise RuntimeError("Model does not have model.model.norm")
-    weight = norm_module.weight.detach().clone()
-    eps = getattr(norm_module, "variance_epsilon", getattr(norm_module, "eps", 1e-6))
-    del model
-    torch.cuda.empty_cache()
-    return weight, eps
+
+
+def teacher_force_eval(
+    raw_model: nn.Module,
+    carry_model: nn.Module,
+    flows: np.ndarray,
+    raw_layer: int,
+    inertia_layer: int,
+    gt_digits: np.ndarray,
+    pred_digits: np.ndarray,
+    sample_ids: np.ndarray,
+    pos_ids: np.ndarray,
+    inertia_delta: float,
+    device: torch.device,
+) -> Tuple[float, float, float, float, float]:
+    """
+    Teacher-forcing 下的离线校正评估
+    复用原有的 evaluate_correction 逻辑，返回相同的 metrics
+    """
+    metrics = evaluate_correction(
+        raw_model,
+        carry_model,
+        flows,
+        raw_layer,
+        inertia_layer,
+        gt_digits,
+        pred_digits,
+        sample_ids,
+        pos_ids,
+        inertia_delta,
+        device,
+    )
+    return (
+        float(metrics["corrected_token_acc"]),
+        float(metrics["corrected_sample_acc"]),
+        float(metrics["modified_rate"]),
+        float(metrics["tp_correction"]),
+        float(metrics["fp_preservation"])
+    )
+
+
+    
 
 
 def online_force_eval(
@@ -568,22 +611,17 @@ def online_force_eval(
     dir12: Dict[int, torch.Tensor] | None = None,
     norm_weight: Optional[torch.Tensor] = None,
     norm_eps: float = 1e-6,
+    add_unit_offset: bool = False,
+    use_prenorm: bool = False,
 ) -> Tuple[float, float, float, float, float]:
     digit_id_list, digit_val_list = get_digit_token_ids(tokenizer)
 
     # 用于捕获 pre-norm hidden states 的容器和 hook
-    # Qwen3 模型的 hidden_states[-1] 已经过 RMSNorm，需要用 hook 捕获 norm 前的状态
-    captured_prenorm: List[torch.Tensor] = []
-
-    def prenorm_hook(module, args, output):
-        # args[0] 是 norm 层的输入（pre-norm hidden states）
-        captured_prenorm.append(args[0].detach())
-
-    # 注册 hook 到 model.model.norm
-    norm_module = getattr(model.model, "norm", None)
+    # 某些模型（如 Qwen3、Phi-3）的 hidden_states[-1] 已经过 RMSNorm，需要用 hook 捕获 norm 前的状态
+    captured_prenorm = []
     hook_handle = None
-    if norm_module is not None:
-        hook_handle = norm_module.register_forward_hook(prenorm_hook)
+    if use_prenorm:
+        captured_prenorm, hook_handle = setup_prenorm_hook(model)
 
     def select_digit(logits: torch.Tensor) -> int:
         digit_logits = logits[:, digit_id_list]
@@ -633,9 +671,7 @@ def online_force_eval(
 
             expr = " + ".join(str(x) for x in operands)
             messages = [{"role": "user", "content": f"Calculate {expr}. Only output a number."}]
-            text = tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
-            )
+            text = apply_chat_template_safe(tokenizer, messages)
             text = text + expr + " = "
 
             model_inputs = tokenizer([text], return_tensors="pt").to(device)
@@ -668,21 +704,32 @@ def online_force_eval(
                 hidden_states = outputs.hidden_states
 
                 # 获取 raw_h 和 inertia_h
-                # 如果请求的层是最后一层，使用 pre-norm states（与 generate.py 保存时一致）
-                if raw_layer_idx == max_layer and len(captured_prenorm) > 0:
-                    raw_h = captured_prenorm[-1][:, -1, :]
-                else:
-                    raw_h = hidden_states[raw_layer_idx][:, -1, :]
+                # 关键: 离线模式在 apply_rms_norm_to_flows 中对 flows 最后一层应用了 RMSNorm
+                # 在线模式需要匹配：从 hidden_states 获取，然后对最后一层应用 RMSNorm
+                # 如果模型最后一层 hidden_states 已归一化，改用 prenorm hook 捕获的原始状态
+                def _get_layer_state(layer_idx: int) -> torch.Tensor:
+                    if use_prenorm and layer_idx == max_layer and captured_prenorm:
+                        return captured_prenorm[-1][:, -1, :]
+                    return hidden_states[layer_idx][:, -1, :]
 
-                if inertia_layer_idx == max_layer and len(captured_prenorm) > 0:
-                    inertia_h = captured_prenorm[-1][:, -1, :]
-                else:
-                    inertia_h = hidden_states[inertia_layer_idx][:, -1, :]
+                raw_h = _get_layer_state(raw_layer_idx)
+                inertia_h = _get_layer_state(inertia_layer_idx)
 
-                # 应用 RMSNorm（与模型内部归一化步骤相同）
-                if norm_weight is not None:
-                    raw_h = rms_norm(raw_h, norm_weight.to(raw_h.device).to(raw_h.dtype), norm_eps)
-                    inertia_h = rms_norm(inertia_h, norm_weight.to(inertia_h.device).to(inertia_h.dtype), norm_eps)
+                # 应用 RMSNorm：仅对最后一层（与离线 apply_rms_norm_to_flows 一致）
+                if norm_weight is not None and raw_layer_idx == max_layer:
+                    raw_h = rms_norm(
+                        raw_h,
+                        norm_weight.to(raw_h.device).to(raw_h.dtype),
+                        norm_eps,
+                        add_unit_offset=add_unit_offset,
+                    )
+                if norm_weight is not None and inertia_layer_idx == max_layer:
+                    inertia_h = rms_norm(
+                        inertia_h,
+                        norm_weight.to(inertia_h.device).to(inertia_h.dtype),
+                        norm_eps,
+                        add_unit_offset=add_unit_offset,
+                    )
 
                 raw_dtype = next(raw_model.parameters()).dtype
                 carry_dtype = next(carry_model.parameters()).dtype
@@ -816,10 +863,17 @@ def online_force_eval(
     return token_acc, sample_acc, modified_rate, tp_correction, fp_preservation
 
 
+def resolve_output_path(output: Optional[Path]) -> Path:
+    if output is not None:
+        return output
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return Path("log/log_experiments") / f"dualstream_probe_{timestamp}.json"
+
+
 def main():
     parser = argparse.ArgumentParser(description="Force-correction probe based on triangle consistency.")
-    parser.add_argument("--h5", type=Path, default=Path("VerticalFlow/results/plus_num3len10_Qwen3-4b/plus_num3len10_Qwen3-4b.h5"), help="Path to HDF5 results")
-    parser.add_argument("--dataset", type=Path, default=Path("VerticalFlow/num3len10-10000.pkl"), help="Dataset used for generation")
+    parser.add_argument("--h5", type=Path, default=Path("results/plus_num3len12_Qwen3-8B/plus_num3len12_Qwen3-8B.h5"), help="Path to HDF5 results")
+    parser.add_argument("--dataset", type=Path, default=Path("num3len12-100000.pkl"), help="Dataset used for generation")
     parser.add_argument(
         "--layers",
         type=str,
@@ -845,13 +899,20 @@ def main():
         default="all",
         help="Filter tokens by model correctness: all/correct/incorrect",
     )
-    parser.add_argument("--inertia-delta", type=float, default=0, help="Delta window around phi for intervention gating")
+    parser.add_argument("--inertia-delta", type=float, default=0.05, help="Delta window around phi for intervention gating")
     parser.add_argument("--vector-steer", action="store_true", help="Use vector steering instead of raw_sum+incarry correction")
     parser.add_argument("--output", type=Path, default=None, help="Optional path to write metrics JSON")
-    parser.add_argument("--test-mode", type=str, choices=["online", "offline"], default="online")
-    parser.add_argument("--model", type=str, default="/data/Models/Qwen3-4b")
+    parser.add_argument("--test-mode", type=str, choices=["online", "offline", "teacher"], default="online")
+    parser.add_argument("--model", type=str, default="/data/wenliuyuan/models/Qwen3-8B")
     parser.add_argument("--max-new-tokens", type=int, default=25)
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=10000,
+        help="Optional cap on dataset size (use first N samples)",
+    )
     args = parser.parse_args()
+    args.output = resolve_output_path(args.output)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
@@ -864,11 +925,48 @@ def main():
     torch.backends.cudnn.benchmark = False
 
     dataset_full = load_dataset(args.dataset)
+    h5_metrics, _ = load_h5_baseline_metrics(
+        args.h5,
+        args.dataset,
+        args.positions,
+        args.train_ratio,
+        args.val_ratio,
+        args.test_ratio,
+        args.seed,
+    )
+    if args.max_samples is not None:
+        if args.max_samples <= 0:
+            raise ValueError("--max-samples must be a positive integer")
+        original_size = len(dataset_full)
+        dataset_full = dataset_full[: args.max_samples]
+        print(f"Using dataset subset: {len(dataset_full)}/{original_size} samples")
     positions = load_positions(args.h5)
+    # 根据模型类型决定是否使用 Gemma 单位偏移
+    model_type = detect_model_type(args.model)
+    add_unit_offset = model_type in ("gemma3")
 
-    # 加载 RMSNorm 参数
+
+    # 加载 RMSNorm 参数（若直接从权重文件失败则回退到实际模型实例）
     print(f"Loading RMSNorm parameters from {args.model}...")
-    norm_weight, norm_eps = get_norm_weight_from_model(args.model, device)
+    try:
+        norm_weight, norm_eps = get_norm_weight_from_model(args.model, device)
+    except RuntimeError:
+        # 某些模型命名不同，直接从已加载模型抓取 norm
+        lm_tmp = AutoModelForCausalLM.from_pretrained(
+            args.model,
+            device_map=device,
+            torch_dtype="auto",
+            output_hidden_states=False,
+        )
+        from model_utils import get_norm_module
+
+        norm_module = get_norm_module(lm_tmp)
+        if norm_module is None:
+            raise
+        norm_weight = norm_module.weight.detach().clone().to(device)
+        norm_eps = getattr(norm_module, "variance_epsilon", getattr(norm_module, "eps", 1e-6))
+        del lm_tmp
+        torch.cuda.empty_cache()
     print(f"RMSNorm eps: {norm_eps}")
 
     def _parse_layer(val: str):
@@ -878,17 +976,67 @@ def main():
 
     layer_pair = (_parse_layer(args.layers[0]), _parse_layer(args.layers[1]))
 
-    flows_all, raw_labels, carry_labels, gt_digits, pred_digits, sample_ids, pos_ids = build_flat_dataset(
-        dataset_full,
-        positions,
-        positions_filter=args.positions,
+    # 对于师生强制模式，预先决定训练集/测试集以减少内存使用
+    dummy_sample_ids = np.arange(len(dataset_full))
+    train_ids_all, val_ids_all, test_ids_all = split_sample_ids(
+        dummy_sample_ids,
+        train_ratio=args.train_ratio,
+        val_ratio=args.val_ratio,
+        test_ratio=args.test_ratio,
+        seed=args.seed,
     )
+    
+    if args.test_mode == "teacher":
+        from model_utils import analyze_last_layer_normalized
+        tokenizer_tf = AutoTokenizer.from_pretrained(args.model, use_fast=True)
+        lm_tf = AutoModelForCausalLM.from_pretrained(
+            args.model,
+            device_map=device,
+            torch_dtype="auto",
+            output_hidden_states=True,
+            do_sample=False,
+        )
+        last_layer_normalized = analyze_last_layer_normalized(lm_tf, tokenizer_tf)
+        print(f"Preparing teacher-forcing features (Total samples: {len(dataset_full)} | Selected: {len(train_ids_all) + len(val_ids_all) + len(test_ids_all)})...")
+        
+        valid_indices = train_ids_all.union(val_ids_all).union(test_ids_all)
+        (flows_all, raw_labels, carry_labels, gt_digits, 
+         pred_digits, sample_ids, pos_ids) = load_or_compute_teacher_features(
+            dataset_full,
+            dataset_path=args.dataset,
+            tokenizer=tokenizer_tf,
+            model=lm_tf,
+            model_name=args.model,
+            max_new_tokens=args.max_new_tokens,
+            device=device,
+            train_ratio=args.train_ratio,
+            val_ratio=args.val_ratio,
+            test_ratio=args.test_ratio,
+            seed=args.seed,
+            use_prenorm=last_layer_normalized,
+            valid_indices=valid_indices,
+            positions=args.positions,
+            max_samples=args.max_samples,
+        )
+        del tokenizer_tf
+        del lm_tf
+        torch.cuda.empty_cache()
+    else:
+        flows_all, raw_labels, carry_labels, gt_digits, pred_digits, sample_ids, pos_ids = build_flat_dataset(
+            dataset_full,
+            positions,
+            positions_filter=args.positions,
+        )
 
     # 对 flows 最后一层应用 RMSNorm
     num_layers = flows_all.shape[1]
     print(f"Applying RMSNorm to flows (last layer {num_layers - 1})...")
-    flows_all = apply_rms_norm_to_flows(flows_all, norm_weight, num_layers - 1, norm_eps)
+    flows_all = apply_rms_norm_to_flows(
+        flows_all, norm_weight, num_layers - 1, norm_eps, add_unit_offset=add_unit_offset
+    )
 
+    # 这里使用实际提取出的 sample_ids 计算掩码
+    # split_sample_ids 仍可根据当前有效的 seed 和过滤后的 ids 工作
     train_ids, val_ids, test_ids = split_sample_ids(
         sample_ids,
         train_ratio=args.train_ratio,
@@ -933,11 +1081,13 @@ def main():
     sample_ids_test = sample_ids[test_mask] if test_mask.any() else sample_ids
     pos_ids_test = pos_ids[test_mask] if test_mask.any() else pos_ids
 
-    orig_token_acc, orig_sample_acc = compute_token_sample_acc(
+    h5_array_token_acc, h5_array_sample_acc = compute_token_sample_acc(
         pred_digits_test, gt_digits_test, sample_ids_test
     )
-    print(f"Original token accuracy (test): {orig_token_acc:.4f}")
-    print(f"Original sample accuracy (test): {orig_sample_acc:.4f}")
+    orig_eval_token_acc = h5_array_token_acc
+    orig_eval_sample_acc = h5_array_sample_acc
+    print(f"Original eval token accuracy (test): {orig_eval_token_acc:.4f}")
+    print(f"Original eval sample accuracy (test): {orig_eval_sample_acc:.4f}")
 
     raw_classes = 10
     num_layers = flows_all.shape[1]
@@ -955,13 +1105,14 @@ def main():
 
     raw_tag = "auto" if layer_pair[0] is None else str(layer_pair[0])
     inertia_tag = "auto" if layer_pair[1] is None else str(layer_pair[1])
+    teacher_suffix = "_teacher" if args.test_mode == "teacher" else ""
     ckpt_name = (
         f"dualstream_probe_{args.h5.stem}_pos{_positions_tag(args.positions)}_"
         f"raw{raw_tag}_in{inertia_tag}_ptype{args.probe_type}_"
         f"sf{args.sample_filter}_seed{args.seed}_"
-        f"tr{args.train_ratio}_vr{args.val_ratio}_te{args.test_ratio}.pt"
+        f"tr{args.train_ratio}_vr{args.val_ratio}_te{args.test_ratio}{teacher_suffix}.pt"
     )
-    save_dir = Path("VerticalFlow/saved_models")
+    save_dir = Path("saved_models")
     save_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = save_dir / ckpt_name
     use_ckpt = ckpt_path.exists()
@@ -1169,6 +1320,21 @@ def main():
         modified_rate = float(metrics["modified_rate"])
         tp_correction = float(metrics["tp_correction"])
         fp_preservation = float(metrics["fp_preservation"])
+    elif args.test_mode == "teacher":
+        print("\nEvaluating teacher-forcing test set...")
+        corrected_token_acc, corrected_sample_acc, modified_rate, tp_correction, fp_preservation = teacher_force_eval(
+            raw_model,
+            carry_model,
+            flows_test,
+            raw_layer_best,
+            inertia_layer_best,
+            gt_digits_test,
+            pred_digits_test,
+            sample_ids_test,
+            pos_ids_test,
+            args.inertia_delta,
+            device,
+        )
     else:
         if args.model is None:
             raise ValueError("--model is required for online test mode")
@@ -1201,15 +1367,17 @@ def main():
                     dir01[d] = torch.tensor(dir01_np[d], dtype=head_dtype, device=device).unsqueeze(0)
                 if dir12_np.get(d) is not None:
                     dir12[d] = torch.tensor(dir12_np[d], dtype=head_dtype, device=device).unsqueeze(0)
-        dataset_test = [dataset_full[i] for i in sorted(test_ids) if 0 <= i < len(dataset_full)]
-        # 从已加载的模型中获取 norm_weight
-        norm_module = getattr(lm.model, "norm", None)
+        dataset_test = [dataset_full[i] for i in sorted(test_ids) if 0 <= i < len(dataset_full)] if test_ids else dataset_full
+        # 从已加载的模型中获取 norm_weight（使用通用函数）
+        from model_utils import get_norm_module
+        norm_module = get_norm_module(lm)
         if norm_module is not None:
             online_norm_weight = norm_module.weight.detach().clone()
             online_norm_eps = getattr(norm_module, "variance_epsilon", getattr(norm_module, "eps", 1e-6))
         else:
             online_norm_weight = norm_weight
             online_norm_eps = norm_eps
+        last_layer_normalized = analyze_last_layer_normalized(lm, tokenizer)
         corrected_token_acc, corrected_sample_acc, modified_rate, tp_correction, fp_preservation = online_force_eval(
             dataset_test,
             tokenizer,
@@ -1226,7 +1394,24 @@ def main():
             dir12=dir12,
             norm_weight=online_norm_weight,
             norm_eps=online_norm_eps,
+            add_unit_offset=add_unit_offset,
+            use_prenorm=last_layer_normalized,
         )
+        orig_eval_token_acc, orig_eval_sample_acc = online_baseline_eval(
+            dataset_test,
+            tokenizer,
+            lm,
+            args.max_new_tokens,
+            device,
+            model_type=model_type,
+        )
+
+    if args.test_mode == "teacher":
+        orig_h5_token_acc = float(h5_metrics["orig_h5_token_acc"])
+        orig_h5_sample_acc = float(h5_metrics["orig_h5_sample_acc"])
+    else:
+        orig_h5_token_acc = float(h5_array_token_acc)
+        orig_h5_sample_acc = float(h5_array_sample_acc)
 
     print("\n=== Force probe (test) ===")
     print(f"Corrected token accuracy: {corrected_token_acc:.4f}")
@@ -1241,8 +1426,12 @@ def main():
         "raw_val_acc": float(raw_val_acc),
         "carry_val_mse": float(carry_val_loss),
         "carry_val_acc_floor": float(carry_val_acc),
-        "orig_token_acc": float(orig_token_acc),
-        "orig_sample_acc": float(orig_sample_acc),
+        "orig_eval_token_acc": float(orig_eval_token_acc),
+        "orig_eval_sample_acc": float(orig_eval_sample_acc),
+        "orig_h5_token_acc": float(orig_h5_token_acc),
+        "orig_h5_sample_acc": float(orig_h5_sample_acc),
+        "orig_token_acc": float(orig_h5_token_acc),
+        "orig_sample_acc": float(orig_h5_sample_acc),
         "corrected_token_acc": float(corrected_token_acc),
         "corrected_sample_acc": float(corrected_sample_acc),
         "modified_rate": float(modified_rate),
@@ -1250,11 +1439,10 @@ def main():
         "fp_preservation": float(fp_preservation),
         "test_mode": args.test_mode,
     }
-    if args.output is not None:
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        with open(args.output, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-        print(f"Saved metrics to {args.output}")
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    with open(args.output, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    print(f"Saved metrics to {args.output}")
 
 
 if __name__ == "__main__":

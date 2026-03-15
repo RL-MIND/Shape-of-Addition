@@ -4,3 +4,5 @@ results/
 saved_models/
 run_batch.py
 test.py
+paper.pdf
+verify.py
