@@ -22,9 +22,9 @@ from model_utils import apply_chat_template_safe, detect_model_type, setup_preno
 DEVICE = 'auto'
 
 # 模型路径
-# MODEL_NAME = "/data/Models/Qwen3-4b"
+MODEL_NAME = "/data/Models/Qwen3-4b"
 
-MODEL_NAME = "/data/wenliuyuan/models/Qwen3-8B"
+# MODEL_NAME = "/data/wenliuyuan/models/Qwen3-8B"
 # MODEL_NAME = "/data/wenliuyuan/models/phi-3-mini-4k-instruct"
 # MODEL_NAME = "/data/wenliuyuan/models/gemma-3-4b-it"
 
@@ -35,7 +35,7 @@ MODEL_NAME = "/data/wenliuyuan/models/Qwen3-8B"
 # DATA_PATH = '/home/wenliuyuan/llm/vertical-flow/dataset/num2len10-10000.pkl'
 # DATA_PATH = '/home/wenliuyuan/llm/vertical-flow/dataset/num3len3-10000.pkl'
 # DATA_PATH = '/home/wenliuyuan/llm/vertical-flow/dataset/num3len10-10000.pkl'
-DATA_PATH = 'num3len12-100000.pkl'
+DATA_PATH = 'num3len10-10000.pkl'
 
 # 运算符配置
 SIGN = 'plus'  # 'plus', 'mul', 'sub', 'div'

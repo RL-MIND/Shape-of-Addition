@@ -67,6 +67,8 @@ def append_common_args(cmd: list[str], args: argparse.Namespace, out_path: Path)
             args.model,
             "--max-new-tokens",
             str(args.max_new_tokens),
+            "--max-samples",
+            str(args.max_samples),
             "--output",
             str(out_path),
         ]
@@ -113,16 +115,17 @@ def print_metrics(metrics: Dict[str, object], skip_orig: bool) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Unified experiment runner.")
-    parser.add_argument("--h5", type=Path, default=Path("results/plus_num3len12_Qwen3-8B/plus_num3len12_Qwen3-8B.h5"))
-    parser.add_argument("--dataset", type=Path, default=Path("num3len12-100000.pkl"))
+    parser.add_argument("--h5", type=Path, default=Path("results/plus_num3len10_Qwen3-4b/plus_num3len10_Qwen3-4b.h5"))
+    parser.add_argument("--dataset", type=Path, default=Path("num3len10-10000.pkl"))
     parser.add_argument("--positions", type=int, nargs="*", default=None)
     parser.add_argument("--train-ratio", type=float, default=0.8)
     parser.add_argument("--val-ratio", type=float, default=0.1)
     parser.add_argument("--test-ratio", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--method", type=str, choices=["mlp", "steer", "force", "dual", "prompt", "all"], default="all")
-    parser.add_argument("--model", type=str, default="/data/wenliuyuan/models/Qwen3-8B")
+    parser.add_argument("--model", type=str, default="/data/Models/Qwen3-4b")
     parser.add_argument("--max-new-tokens", type=int, default=25)
+    parser.add_argument("--max-samples", type=int, default=10000)
     parser.add_argument("--test-mode", type=str, choices=["online", "offline", "teacher"], default="online")
     parser.add_argument("--layer-start", type=int, default=None)
     parser.add_argument("--layer-end", type=int, default=None)

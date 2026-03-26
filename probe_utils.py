@@ -21,6 +21,95 @@ def _safe_model_tag(model_name: str) -> str:
     return tag.strip("_") or "model"
 
 
+def normalize_layer_index(layer_idx: int, total_layers: int) -> int:
+    if layer_idx < 0:
+        layer_idx = total_layers + layer_idx
+    return max(0, min(total_layers - 1, layer_idx))
+
+
+def resolve_selected_layers(layer_indices: Optional[List[int]], total_layers: int) -> Optional[List[int]]:
+    if not layer_indices:
+        return None
+    resolved: List[int] = []
+    seen = set()
+    for layer_idx in layer_indices:
+        normalized = normalize_layer_index(layer_idx, total_layers)
+        if normalized not in seen:
+            resolved.append(normalized)
+            seen.add(normalized)
+    return resolved or None
+
+
+def inspect_teacher_layers(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    prompt: str = "1 + 1 = ",
+) -> Tuple[int, dict[str, object]]:
+    config = getattr(model, "config", None)
+    text_config = getattr(config, "text_config", None) if config is not None else None
+    config_layers = getattr(config, "num_hidden_layers", None) if config is not None else None
+    text_config_layers = getattr(text_config, "num_hidden_layers", None) if text_config is not None else None
+    hidden_states_len = None
+    forward_error = None
+
+    model_device = getattr(model, "device", None)
+    if model_device is None or str(model_device) == "meta":
+        try:
+            model_device = next(model.parameters()).device
+        except StopIteration:
+            model_device = torch.device("cpu")
+
+    try:
+        model_inputs = tokenizer(prompt, return_tensors="pt")
+        model_inputs = {k: v.to(model_device) for k, v in model_inputs.items()}
+        with torch.no_grad():
+            outputs = model(**model_inputs, use_cache=False, output_hidden_states=True)
+        if getattr(outputs, "hidden_states", None) is not None:
+            hidden_states_len = len(outputs.hidden_states)
+        del outputs
+    except Exception as exc:
+        forward_error = f"{type(exc).__name__}: {exc}"
+
+    if isinstance(hidden_states_len, int) and hidden_states_len > 0:
+        total_layers = hidden_states_len
+        source = "forward_hidden_states"
+    elif isinstance(text_config_layers, int) and text_config_layers > 0:
+        total_layers = text_config_layers + 1
+        source = "config.text_config.num_hidden_layers"
+    elif isinstance(config_layers, int) and config_layers > 0:
+        total_layers = config_layers + 1
+        source = "config.num_hidden_layers"
+    else:
+        raise RuntimeError(
+            "Unable to determine teacher layer count from hidden states or config metadata."
+        )
+
+    diagnostics = {
+        "config_class": config.__class__.__name__ if config is not None else "<missing>",
+        "config_num_hidden_layers": config_layers if config_layers is not None else "<missing>",
+        "text_config_num_hidden_layers": text_config_layers if text_config_layers is not None else "<missing>",
+        "hidden_states_len": hidden_states_len if hidden_states_len is not None else "<missing>",
+        "layer_source": source,
+        "forward_error": forward_error,
+    }
+    return total_layers, diagnostics
+
+
+def resolve_teacher_final_norm_local_index(
+    selected_layers: Optional[List[int]],
+    total_layers: int,
+) -> Optional[int]:
+    if total_layers <= 0:
+        return None
+    final_layer = total_layers - 1
+    if selected_layers is None:
+        return final_layer
+    try:
+        return selected_layers.index(final_layer)
+    except ValueError:
+        return None
+
+
 def get_digit_token_ids(tokenizer: AutoTokenizer) -> Tuple[List[int], List[int]]:
     digit_ids = {}
     for d in range(10):
@@ -115,6 +204,7 @@ def teacher_force_extract(
     use_prenorm: bool = False,
     valid_indices: Optional[set[int]] = None,
     model_type: Optional[str] = None,
+    selected_layers: Optional[List[int]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     del max_new_tokens
     digit_id_list, digit_val_list = get_digit_token_ids(tokenizer)
@@ -161,13 +251,14 @@ def teacher_force_extract(
             )
             hidden_states = outputs.hidden_states
             max_layer = len(hidden_states) - 1
+            layer_indices = selected_layers if selected_layers is not None else list(range(max_layer + 1))
 
             for pos_idx, seq_idx in enumerate(answer_indices):
                 logits = outputs.logits[0, seq_idx - 1, :]
                 d_pred = select_digit(logits.unsqueeze(0))
 
                 layer_states = []
-                for layer_idx in range(max_layer + 1):
+                for layer_idx in layer_indices:
                     if use_prenorm and layer_idx == max_layer and captured_prenorm:
                         hidden = captured_prenorm[-1][0, seq_idx - 1, :].float().cpu().numpy()
                     else:
@@ -219,16 +310,18 @@ def resolve_teacher_cache_path(
     positions: Optional[List[int]] = None,
     max_samples: Optional[int] = None,
     use_prenorm: bool = False,
+    selected_layers: Optional[List[int]] = None,
     cache_dir: Path = Path("saved_models/teacher_cache"),
 ) -> Path:
     cache_dir.mkdir(parents=True, exist_ok=True)
     max_samples_tag = "all" if max_samples is None else str(max_samples)
     prenorm_tag = "prenorm" if use_prenorm else "postnorm"
+    layers_tag = "alllayers" if not selected_layers else "layers" + "-".join(str(layer) for layer in selected_layers)
     name = (
         f"teacher_features_{dataset_path.stem}_{_safe_model_tag(model_name)}_"
         f"pos{_positions_tag(positions)}_seed{seed}_"
         f"tr{train_ratio}_vr{val_ratio}_te{test_ratio}_"
-        f"ms{max_samples_tag}_{prenorm_tag}.pt"
+        f"ms{max_samples_tag}_{prenorm_tag}_{layers_tag}.pt"
     )
     return cache_dir / name
 
@@ -250,6 +343,7 @@ def load_or_compute_teacher_features(
     positions: Optional[List[int]] = None,
     max_samples: Optional[int] = None,
     model_type: Optional[str] = None,
+    selected_layers: Optional[List[int]] = None,
     cache_dir: Path = Path("saved_models/teacher_cache"),
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     cache_path = resolve_teacher_cache_path(
@@ -262,10 +356,12 @@ def load_or_compute_teacher_features(
         positions=positions,
         max_samples=max_samples,
         use_prenorm=use_prenorm,
+        selected_layers=selected_layers,
         cache_dir=cache_dir,
     )
     if cache_path.exists():
-        payload = torch.load(cache_path, map_location="cpu")
+        with open(cache_path, "rb") as f:
+            payload = pickle.load(f)
         print(f"Loaded teacher features from {cache_path}")
         return (
             payload["flows_all"],
@@ -286,6 +382,7 @@ def load_or_compute_teacher_features(
         use_prenorm=use_prenorm,
         valid_indices=valid_indices,
         model_type=model_type,
+        selected_layers=selected_layers,
     )
     payload = {
         "flows_all": outputs[0],
@@ -297,11 +394,8 @@ def load_or_compute_teacher_features(
         "pos_ids": outputs[6],
     }
     tmp_cache_path = cache_path.with_suffix(f"{cache_path.suffix}.tmp")
-    torch.save(
-        payload,
-        tmp_cache_path,
-        pickle_protocol=pickle.HIGHEST_PROTOCOL,
-    )
+    with open(tmp_cache_path, "wb") as f:
+        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
     tmp_cache_path.replace(cache_path)
     print(f"Saved teacher features to {cache_path}")
     return outputs

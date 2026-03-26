@@ -23,8 +23,12 @@ from probe_data import (
 )
 from probe_utils import (
     get_digit_token_ids as shared_get_digit_token_ids,
+    inspect_teacher_layers,
     load_or_compute_teacher_features,
+    normalize_layer_index,
     online_baseline_eval,
+    resolve_teacher_final_norm_local_index,
+    resolve_selected_layers,
     teacher_force_extract as shared_teacher_force_extract,
 )
 from verify import (
@@ -33,6 +37,22 @@ from verify import (
     compute_means,
     load_position_arrays,
 )
+
+
+OFF_BY_ONE_ROWS = ("minus_one", "plus_one")
+OFF_BY_ONE_COLS = ("fixed_to_gt", "still_off_by_one", "other_wrong")
+T_CRITICAL_95 = {
+    1: 12.706,
+    2: 4.303,
+    3: 3.182,
+    4: 2.776,
+    5: 2.571,
+    6: 2.447,
+    7: 2.365,
+    8: 2.306,
+    9: 2.262,
+    10: 2.228,
+}
 
 
 def mask_first_error_positions(
@@ -53,6 +73,147 @@ def mask_first_error_positions(
         min_pos = pos_ids[sid_mask].min()
         keep[sid_mask & (pos_ids != min_pos)] = False
     return keep
+
+
+def get_off_by_one_direction(pred_digit: int, gt_digit: int) -> Optional[str]:
+    if not (0 <= pred_digit <= 9 and 0 <= gt_digit <= 9):
+        return None
+    diff = (pred_digit - gt_digit) % 10
+    if diff == 9:
+        return "minus_one"
+    if diff == 1:
+        return "plus_one"
+    return None
+
+
+def make_empty_off_by_one_confusion() -> Dict[str, Dict[str, int]]:
+    return {
+        row: {col: 0 for col in OFF_BY_ONE_COLS}
+        for row in OFF_BY_ONE_ROWS
+    }
+
+
+def analyze_off_by_one_errors(
+    pred_digits: np.ndarray,
+    gt_digits: np.ndarray,
+    corrected_digits: Optional[np.ndarray] = None,
+) -> Dict[str, object]:
+    pred_arr = np.asarray(pred_digits, dtype=np.int64)
+    gt_arr = np.asarray(gt_digits, dtype=np.int64)
+    corrected_arr = None if corrected_digits is None else np.asarray(corrected_digits, dtype=np.int64)
+
+    orig_error_mask = pred_arr != gt_arr
+    orig_error_count = int(np.sum(orig_error_mask))
+    confusion = make_empty_off_by_one_confusion()
+    off_by_one_count = 0
+
+    for idx in np.flatnonzero(orig_error_mask):
+        direction = get_off_by_one_direction(int(pred_arr[idx]), int(gt_arr[idx]))
+        if direction is None:
+            continue
+        off_by_one_count += 1
+        if corrected_arr is None:
+            continue
+        corrected_digit = int(corrected_arr[idx])
+        if corrected_digit == int(gt_arr[idx]):
+            outcome = "fixed_to_gt"
+        elif get_off_by_one_direction(corrected_digit, int(gt_arr[idx])) is not None:
+            outcome = "still_off_by_one"
+        else:
+            outcome = "other_wrong"
+        confusion[direction][outcome] += 1
+
+    other_error_count = int(orig_error_count - off_by_one_count)
+    denom = orig_error_count if orig_error_count > 0 else 1
+    return {
+        "orig_error_count": orig_error_count,
+        "off_by_one_count": int(off_by_one_count),
+        "other_error_count": int(other_error_count),
+        "off_by_one_ratio": float(off_by_one_count / denom) if orig_error_count > 0 else 0.0,
+        "other_error_ratio": float(other_error_count / denom) if orig_error_count > 0 else 0.0,
+        "off_by_one_confusion": confusion,
+    }
+
+
+def compute_mean_std_ci(values: List[float]) -> Dict[str, Optional[float]]:
+    clean_values = [float(v) for v in values if not math.isnan(float(v)) and not math.isinf(float(v))]
+    if not clean_values:
+        return {"count": 0, "mean": None, "std": None, "ci95_low": None, "ci95_high": None}
+    arr = np.asarray(clean_values, dtype=np.float64)
+    mean = float(np.mean(arr))
+    if arr.size == 1:
+        return {"count": 1, "mean": mean, "std": 0.0, "ci95_low": mean, "ci95_high": mean}
+    std = float(np.std(arr, ddof=1))
+    df = arr.size - 1
+    t_critical = T_CRITICAL_95.get(df, 1.96)
+    margin = float(t_critical * std / math.sqrt(arr.size))
+    return {
+        "count": int(arr.size),
+        "mean": mean,
+        "std": std,
+        "ci95_low": mean - margin,
+        "ci95_high": mean + margin,
+    }
+
+
+def aggregate_seed_payloads(seed_payloads: List[Dict[str, object]]) -> Dict[str, object]:
+    metric_keys = [
+        "raw_val_acc",
+        "carry_val_mse",
+        "carry_val_acc_floor",
+        "val_corrected_token_acc",
+        "val_corrected_sample_acc",
+        "val_modified_rate",
+        "val_tp_correction",
+        "val_fp_preservation",
+        "val_auc",
+        "orig_eval_token_acc",
+        "orig_eval_sample_acc",
+        "orig_h5_token_acc",
+        "orig_h5_sample_acc",
+        "orig_token_acc",
+        "orig_sample_acc",
+        "corrected_token_acc",
+        "corrected_sample_acc",
+        "modified_rate",
+        "tp_correction",
+        "fp_preservation",
+        "test_auc",
+        "off_by_one_count",
+        "other_error_count",
+        "off_by_one_ratio",
+        "other_error_ratio",
+    ]
+    metrics = {
+        key: compute_mean_std_ci([float(payload[key]) for payload in seed_payloads if key in payload])
+        for key in metric_keys
+    }
+
+    confusion_sum = make_empty_off_by_one_confusion()
+    confusion_mean = {
+        row: {col: 0.0 for col in OFF_BY_ONE_COLS}
+        for row in OFF_BY_ONE_ROWS
+    }
+    for payload in seed_payloads:
+        confusion = payload.get("off_by_one_confusion", {})
+        for row in OFF_BY_ONE_ROWS:
+            row_values = confusion.get(row, {})
+            for col in OFF_BY_ONE_COLS:
+                value = int(row_values.get(col, 0))
+                confusion_sum[row][col] += value
+                confusion_mean[row][col] += value
+
+    denom = max(len(seed_payloads), 1)
+    for row in OFF_BY_ONE_ROWS:
+        for col in OFF_BY_ONE_COLS:
+            confusion_mean[row][col] = float(confusion_mean[row][col] / denom)
+
+    return {
+        "num_runs": int(len(seed_payloads)),
+        "metrics": metrics,
+        "off_by_one_confusion_sum": confusion_sum,
+        "off_by_one_confusion_mean": confusion_mean,
+    }
 
 
 # ===========================
@@ -344,6 +505,7 @@ def evaluate_correction(
             corrected_sample_correct += 1
     sample_acc_orig = orig_sample_correct / len(unique_samples) if len(unique_samples) else 0.0
     sample_acc_corrected = corrected_sample_correct / len(unique_samples) if len(unique_samples) else 0.0
+    error_stats = analyze_off_by_one_errors(pred_digits, gt_digits, corrected)
 
     return {
         "total": float(len(gt_digits)),
@@ -357,6 +519,12 @@ def evaluate_correction(
         "modified_rate": modified_rate,
         "tp_correction": tp_correction,
         "fp_preservation": fp_preservation,
+        "orig_error_count": int(error_stats["orig_error_count"]),
+        "off_by_one_count": int(error_stats["off_by_one_count"]),
+        "other_error_count": int(error_stats["other_error_count"]),
+        "off_by_one_ratio": float(error_stats["off_by_one_ratio"]),
+        "other_error_ratio": float(error_stats["other_error_ratio"]),
+        "off_by_one_confusion": error_stats["off_by_one_confusion"],
     }
 
 
@@ -496,6 +664,7 @@ def evaluate_correction_vector_steer(
             corrected_sample_correct += 1
     sample_acc_orig = orig_sample_correct / len(unique_samples) if len(unique_samples) else 0.0
     sample_acc_corrected = corrected_sample_correct / len(unique_samples) if len(unique_samples) else 0.0
+    error_stats = analyze_off_by_one_errors(pred_digits, gt_digits, corrected)
 
     return {
         "total": float(len(gt_digits)),
@@ -507,6 +676,12 @@ def evaluate_correction_vector_steer(
         "modified_rate": modified_rate,
         "tp_correction": tp_correction,
         "fp_preservation": fp_preservation,
+        "orig_error_count": int(error_stats["orig_error_count"]),
+        "off_by_one_count": int(error_stats["off_by_one_count"]),
+        "other_error_count": int(error_stats["other_error_count"]),
+        "off_by_one_ratio": float(error_stats["off_by_one_ratio"]),
+        "other_error_ratio": float(error_stats["other_error_ratio"]),
+        "off_by_one_confusion": error_stats["off_by_one_confusion"],
     }
 
 
@@ -565,7 +740,7 @@ def teacher_force_eval(
     pos_ids: np.ndarray,
     inertia_delta: float,
     device: torch.device,
-) -> Tuple[float, float, float, float, float]:
+) -> Dict[str, object]:
     """
     Teacher-forcing 下的离线校正评估
     复用原有的 evaluate_correction 逻辑，返回相同的 metrics
@@ -583,13 +758,13 @@ def teacher_force_eval(
         inertia_delta,
         device,
     )
-    return (
-        float(metrics["corrected_token_acc"]),
-        float(metrics["corrected_sample_acc"]),
-        float(metrics["modified_rate"]),
-        float(metrics["tp_correction"]),
-        float(metrics["fp_preservation"])
-    )
+    return metrics
+
+
+def compute_point_auc(tp_correction: float, fp_preservation: float) -> float:
+    if math.isnan(tp_correction) or math.isnan(fp_preservation):
+        return float("nan")
+    return 0.5 * (tp_correction + fp_preservation)
 
 
     
@@ -613,7 +788,7 @@ def online_force_eval(
     norm_eps: float = 1e-6,
     add_unit_offset: bool = False,
     use_prenorm: bool = False,
-) -> Tuple[float, float, float, float, float]:
+) -> Dict[str, object]:
     digit_id_list, digit_val_list = get_digit_token_ids(tokenizer)
 
     # 用于捕获 pre-norm hidden states 的容器和 hook
@@ -650,6 +825,9 @@ def online_force_eval(
     tp_corrected = 0  # 模型原始错误中被探针修正的数量
     fp_total = 0  # 模型原始正确的token数
     fp_preserved = 0  # 模型原始正确中探针保持不变的数量
+    gt_digits_eval: List[int] = []
+    orig_digits_eval: List[int] = []
+    corrected_digits_eval: List[int] = []
 
     lm_head = None
     if vector_steer:
@@ -848,6 +1026,11 @@ def online_force_eval(
                     if i < g_len and corr_digit == gt_digit:
                         fp_preserved += 1
 
+                if i < t_len and i < o_len and i < g_len:
+                    gt_digits_eval.append(int(gt_digit))
+                    orig_digits_eval.append(int(orig_digit))
+                    corrected_digits_eval.append(int(corr_digit))
+
             if g_len == t_len and all(generated_digits[i] == int(gt_str[i]) for i in range(t_len)):
                 sample_correct += 1
 
@@ -860,7 +1043,26 @@ def online_force_eval(
     modified_rate = modified_count / token_total if token_total else 0.0
     tp_correction = tp_corrected / tp_total if tp_total else float("nan")
     fp_preservation = fp_preserved / fp_total if fp_total else float("nan")
-    return token_acc, sample_acc, modified_rate, tp_correction, fp_preservation
+    gt_eval_np = np.asarray(gt_digits_eval, dtype=np.int64)
+    orig_eval_np = np.asarray(orig_digits_eval, dtype=np.int64)
+    corrected_eval_np = np.asarray(corrected_digits_eval, dtype=np.int64)
+    error_stats = analyze_off_by_one_errors(orig_eval_np, gt_eval_np, corrected_eval_np)
+    return {
+        "corrected_token_acc": float(token_acc),
+        "corrected_sample_acc": float(sample_acc),
+        "modified_rate": float(modified_rate),
+        "tp_correction": float(tp_correction),
+        "fp_preservation": float(fp_preservation),
+        "orig_digits_eval": orig_eval_np,
+        "corrected_digits_eval": corrected_eval_np,
+        "gt_digits_eval": gt_eval_np,
+        "orig_error_count": int(error_stats["orig_error_count"]),
+        "off_by_one_count": int(error_stats["off_by_one_count"]),
+        "other_error_count": int(error_stats["other_error_count"]),
+        "off_by_one_ratio": float(error_stats["off_by_one_ratio"]),
+        "other_error_ratio": float(error_stats["other_error_ratio"]),
+        "off_by_one_confusion": error_stats["off_by_one_confusion"],
+    }
 
 
 def resolve_output_path(output: Optional[Path]) -> Path:
@@ -870,57 +1072,19 @@ def resolve_output_path(output: Optional[Path]) -> Path:
     return Path("log/log_experiments") / f"dualstream_probe_{timestamp}.json"
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Force-correction probe based on triangle consistency.")
-    parser.add_argument("--h5", type=Path, default=Path("results/plus_num3len12_Qwen3-8B/plus_num3len12_Qwen3-8B.h5"), help="Path to HDF5 results")
-    parser.add_argument("--dataset", type=Path, default=Path("num3len12-100000.pkl"), help="Dataset used for generation")
-    parser.add_argument(
-        "--layers",
-        type=str,
-        nargs=2,
-        metavar=("S_RAW_LAYER", "INERTIA_LAYER"),
-        default=[-1, -1],
-        help="Layer pair for S_raw and inertia probes; use 'none' to auto-search best layer",
-    )
-    parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--epochs", type=int, default=200)
-    parser.add_argument("--patience", type=int, default=20)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--train-ratio", type=float, default=0.8)
-    parser.add_argument("--val-ratio", type=float, default=0.1)
-    parser.add_argument("--test-ratio", type=float, default=0.1)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--probe-type", type=str, choices=["linear", "mlp"], default="mlp", help="Probe architecture")
-    parser.add_argument("--positions", type=int, nargs="*", default=None, help="Positions to include; default all")
-    parser.add_argument(
-        "--sample-filter",
-        type=str,
-        choices=["all", "correct", "incorrect"],
-        default="all",
-        help="Filter tokens by model correctness: all/correct/incorrect",
-    )
-    parser.add_argument("--inertia-delta", type=float, default=0.05, help="Delta window around phi for intervention gating")
-    parser.add_argument("--vector-steer", action="store_true", help="Use vector steering instead of raw_sum+incarry correction")
-    parser.add_argument("--output", type=Path, default=None, help="Optional path to write metrics JSON")
-    parser.add_argument("--test-mode", type=str, choices=["online", "offline", "teacher"], default="online")
-    parser.add_argument("--model", type=str, default="/data/wenliuyuan/models/Qwen3-8B")
-    parser.add_argument("--max-new-tokens", type=int, default=25)
-    parser.add_argument(
-        "--max-samples",
-        type=int,
-        default=10000,
-        help="Optional cap on dataset size (use first N samples)",
-    )
-    args = parser.parse_args()
-    args.output = resolve_output_path(args.output)
-
+def run_single_seed(
+    args: argparse.Namespace,
+    seed: int,
+    output_path: Optional[Path] = None,
+    persist_output: bool = False,
+) -> Dict[str, object]:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
+    print(f"\n===== Dualstream Probe | seed={seed} | device={device} =====")
 
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
+        torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
@@ -932,7 +1096,7 @@ def main():
         args.train_ratio,
         args.val_ratio,
         args.test_ratio,
-        args.seed,
+        seed,
     )
     if args.max_samples is not None:
         if args.max_samples <= 0:
@@ -983,11 +1147,10 @@ def main():
         train_ratio=args.train_ratio,
         val_ratio=args.val_ratio,
         test_ratio=args.test_ratio,
-        seed=args.seed,
+        seed=seed,
     )
     
     if args.test_mode == "teacher":
-        from model_utils import analyze_last_layer_normalized
         tokenizer_tf = AutoTokenizer.from_pretrained(args.model, use_fast=True)
         lm_tf = AutoModelForCausalLM.from_pretrained(
             args.model,
@@ -997,6 +1160,29 @@ def main():
             do_sample=False,
         )
         last_layer_normalized = analyze_last_layer_normalized(lm_tf, tokenizer_tf)
+        teacher_total_layers, teacher_diag = inspect_teacher_layers(lm_tf, tokenizer_tf)
+        teacher_requested_layers = []
+        if layer_pair[0] is not None:
+            teacher_requested_layers.append(layer_pair[0])
+        if layer_pair[1] is not None:
+            teacher_requested_layers.append(layer_pair[1])
+        selected_teacher_layers = (
+            resolve_selected_layers(teacher_requested_layers, teacher_total_layers)
+            if teacher_requested_layers
+            else None
+        )
+        print(
+            "Teacher layer diagnostics: "
+            f"config_class={teacher_diag['config_class']} | "
+            f"config.num_hidden_layers={teacher_diag['config_num_hidden_layers']} | "
+            f"text_config.num_hidden_layers={teacher_diag['text_config_num_hidden_layers']} | "
+            f"hidden_states_len={teacher_diag['hidden_states_len']} | "
+            f"layer_source={teacher_diag['layer_source']} | "
+            f"requested_layers={teacher_requested_layers if teacher_requested_layers else 'all'} | "
+            f"resolved_layers={selected_teacher_layers if selected_teacher_layers is not None else 'all'}"
+        )
+        if teacher_diag["forward_error"] is not None:
+            print(f"Teacher layer forward probe fallback: {teacher_diag['forward_error']}")
         print(f"Preparing teacher-forcing features (Total samples: {len(dataset_full)} | Selected: {len(train_ids_all) + len(val_ids_all) + len(test_ids_all)})...")
         
         valid_indices = train_ids_all.union(val_ids_all).union(test_ids_all)
@@ -1012,28 +1198,46 @@ def main():
             train_ratio=args.train_ratio,
             val_ratio=args.val_ratio,
             test_ratio=args.test_ratio,
-            seed=args.seed,
+            seed=seed,
             use_prenorm=last_layer_normalized,
             valid_indices=valid_indices,
             positions=args.positions,
             max_samples=args.max_samples,
+            selected_layers=selected_teacher_layers,
         )
         del tokenizer_tf
         del lm_tf
         torch.cuda.empty_cache()
     else:
+        teacher_total_layers = None
+        selected_teacher_layers = None
         flows_all, raw_labels, carry_labels, gt_digits, pred_digits, sample_ids, pos_ids = build_flat_dataset(
             dataset_full,
             positions,
             positions_filter=args.positions,
         )
 
-    # 对 flows 最后一层应用 RMSNorm
     num_layers = flows_all.shape[1]
-    print(f"Applying RMSNorm to flows (last layer {num_layers - 1})...")
-    flows_all = apply_rms_norm_to_flows(
-        flows_all, norm_weight, num_layers - 1, norm_eps, add_unit_offset=add_unit_offset
-    )
+    if args.test_mode == "teacher":
+        norm_layer_idx = resolve_teacher_final_norm_local_index(selected_teacher_layers, teacher_total_layers)
+        if norm_layer_idx is not None:
+            print(
+                f"Applying RMSNorm to flows (teacher final layer local={norm_layer_idx}, "
+                f"global={teacher_total_layers - 1})..."
+            )
+            flows_all = apply_rms_norm_to_flows(
+                flows_all, norm_weight, norm_layer_idx, norm_eps, add_unit_offset=add_unit_offset
+            )
+        else:
+            print(
+                "Skipping RMSNorm on teacher flows because cached layers do not include "
+                f"the final layer {teacher_total_layers - 1}."
+            )
+    else:
+        print(f"Applying RMSNorm to flows (last layer {num_layers - 1})...")
+        flows_all = apply_rms_norm_to_flows(
+            flows_all, norm_weight, num_layers - 1, norm_eps, add_unit_offset=add_unit_offset
+        )
 
     # 这里使用实际提取出的 sample_ids 计算掩码
     # split_sample_ids 仍可根据当前有效的 seed 和过滤后的 ids 工作
@@ -1042,7 +1246,7 @@ def main():
         train_ratio=args.train_ratio,
         val_ratio=args.val_ratio,
         test_ratio=args.test_ratio,
-        seed=args.seed,
+        seed=seed,
     )
 
     train_mask = np.isin(sample_ids, list(train_ids))
@@ -1072,6 +1276,10 @@ def main():
     flows_val = flows_all[val_mask] if val_mask.any() else flows_all
     raw_labels_val = raw_labels[val_mask] if val_mask.any() else raw_labels
     carry_labels_val = carry_labels[val_mask] if val_mask.any() else carry_labels
+    gt_digits_val = gt_digits[val_mask] if val_mask.any() else gt_digits
+    pred_digits_val = pred_digits[val_mask] if val_mask.any() else pred_digits
+    sample_ids_val = sample_ids[val_mask] if val_mask.any() else sample_ids
+    pos_ids_val = pos_ids[val_mask] if val_mask.any() else pos_ids
 
     flows_test = flows_all[test_mask] if test_mask.any() else flows_all
     raw_labels_test = raw_labels[test_mask] if test_mask.any() else raw_labels
@@ -1080,6 +1288,7 @@ def main():
     pred_digits_test = pred_digits[test_mask] if test_mask.any() else pred_digits
     sample_ids_test = sample_ids[test_mask] if test_mask.any() else sample_ids
     pos_ids_test = pos_ids[test_mask] if test_mask.any() else pos_ids
+    base_error_stats = analyze_off_by_one_errors(pred_digits_test, gt_digits_test)
 
     h5_array_token_acc, h5_array_sample_acc = compute_token_sample_acc(
         pred_digits_test, gt_digits_test, sample_ids_test
@@ -1098,6 +1307,22 @@ def main():
         f"raw_classes={raw_classes} | train_samples={len(train_ids)} | val_samples={len(val_ids)} | test_samples={len(test_ids)}"
     )
 
+    selected_teacher_layer_map = (
+        {layer_idx: local_idx for local_idx, layer_idx in enumerate(selected_teacher_layers)}
+        if selected_teacher_layers is not None
+        else None
+    )
+
+    def flow_layer_index(layer_value: int) -> int:
+        if selected_teacher_layer_map is None:
+            return layer_value
+        if teacher_total_layers is None:
+            raise RuntimeError("teacher_total_layers is required when using selected teacher layers")
+        normalized = normalize_layer_index(layer_value, teacher_total_layers)
+        if normalized not in selected_teacher_layer_map:
+            raise KeyError(f"Layer {layer_value} (normalized to {normalized}) not found in cached teacher layers")
+        return selected_teacher_layer_map[normalized]
+
     def _positions_tag(pos_list: List[int] | None) -> str:
         if not pos_list:
             return "all"
@@ -1106,11 +1331,18 @@ def main():
     raw_tag = "auto" if layer_pair[0] is None else str(layer_pair[0])
     inertia_tag = "auto" if layer_pair[1] is None else str(layer_pair[1])
     teacher_suffix = "_teacher" if args.test_mode == "teacher" else ""
+    teacher_layers_tag = ""
+    if args.test_mode == "teacher":
+        teacher_layers_tag = (
+            "_tlayersall"
+            if selected_teacher_layers is None
+            else "_tlayers" + "-".join(str(layer) for layer in selected_teacher_layers)
+        )
     ckpt_name = (
         f"dualstream_probe_{args.h5.stem}_pos{_positions_tag(args.positions)}_"
         f"raw{raw_tag}_in{inertia_tag}_ptype{args.probe_type}_"
-        f"sf{args.sample_filter}_seed{args.seed}_"
-        f"tr{args.train_ratio}_vr{args.val_ratio}_te{args.test_ratio}{teacher_suffix}.pt"
+        f"sf{args.sample_filter}_seed{seed}_"
+        f"tr{args.train_ratio}_vr{args.val_ratio}_te{args.test_ratio}{teacher_suffix}{teacher_layers_tag}.pt"
     )
     save_dir = Path("saved_models")
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -1142,11 +1374,11 @@ def main():
         # ---------- Raw probe (S_raw) ----------
         if layer_pair[0] is not None:
             raw_layer_best = layer_pair[0]
-            raw_vecs = flows_train[:, raw_layer_best, :]
+            raw_vecs = flows_train[:, flow_layer_index(raw_layer_best), :]
             raw_model, raw_val_acc = train_probe(
                 raw_vecs,
                 raw_labels_train,
-                flows_val[:, raw_layer_best, :],
+                flows_val[:, flow_layer_index(raw_layer_best), :],
                 raw_labels_val,
                 num_classes=raw_classes,
                 batch_size=args.batch_size,
@@ -1185,11 +1417,11 @@ def main():
         # ---------- Carry probe (inertia) regression ----------
         if layer_pair[1] is not None:
             inertia_layer_best = layer_pair[1]
-            inertia_vecs = flows_train[:, inertia_layer_best, :]
+            inertia_vecs = flows_train[:, flow_layer_index(inertia_layer_best), :]
             carry_model, carry_val_loss, _ = train_carry_regressor(
                 inertia_vecs,
                 carry_labels_train,
-                flows_val[:, inertia_layer_best, :],
+                flows_val[:, flow_layer_index(inertia_layer_best), :],
                 carry_labels_val,
                 batch_size=args.batch_size,
                 lr=args.lr,
@@ -1198,7 +1430,7 @@ def main():
                 device=device,
                 probe_type=args.probe_type,
             )
-            inertia_vecs = flows_train[:, inertia_layer_best, :]
+            inertia_vecs = flows_train[:, flow_layer_index(inertia_layer_best), :]
         else:
             carry_best = (float("inf"), float("nan"), None, None, None)  # val_loss, full_loss placeholder, layer, model, vecs
             for l in range(num_layers):
@@ -1222,7 +1454,7 @@ def main():
             raise RuntimeError("Failed to train carry probe; no layer selected")
         carry_val_acc = evaluate_carry_accuracy_floor(
             carry_model,
-            flows_val[:, inertia_layer_best, :],
+            flows_val[:, flow_layer_index(inertia_layer_best), :],
             carry_labels_val,
             batch_size=args.batch_size,
             device=device,
@@ -1254,6 +1486,67 @@ def main():
             f"val_acc_floor={carry_val_acc:.4f}"
         )
 
+    raw_layer_flow_idx = flow_layer_index(raw_layer_best)
+    inertia_layer_flow_idx = flow_layer_index(inertia_layer_best)
+
+    val_corrected_token_acc = float("nan")
+    val_corrected_sample_acc = float("nan")
+    val_modified_rate = float("nan")
+    val_tp_correction = float("nan")
+    val_fp_preservation = float("nan")
+    val_auc = float("nan")
+
+    if args.test_mode == "teacher":
+        val_metrics = teacher_force_eval(
+            raw_model,
+            carry_model,
+            flows_val,
+            raw_layer_flow_idx,
+            inertia_layer_flow_idx,
+            gt_digits_val,
+            pred_digits_val,
+            sample_ids_val,
+            pos_ids_val,
+            args.inertia_delta,
+            device,
+        )
+        val_corrected_token_acc = float(val_metrics["corrected_token_acc"])
+        val_corrected_sample_acc = float(val_metrics["corrected_sample_acc"])
+        val_modified_rate = float(val_metrics["modified_rate"])
+        val_tp_correction = float(val_metrics["tp_correction"])
+        val_fp_preservation = float(val_metrics["fp_preservation"])
+        val_auc = compute_point_auc(val_tp_correction, val_fp_preservation)
+    elif args.test_mode == "offline" and not args.vector_steer:
+        val_metrics = evaluate_correction(
+            raw_model,
+            carry_model,
+            flows_val,
+            raw_layer_flow_idx,
+            inertia_layer_flow_idx,
+            gt_digits_val,
+            pred_digits_val,
+            sample_ids_val,
+            pos_ids_val,
+            args.inertia_delta,
+            device,
+        )
+        val_corrected_token_acc = float(val_metrics["corrected_token_acc"])
+        val_corrected_sample_acc = float(val_metrics["corrected_sample_acc"])
+        val_modified_rate = float(val_metrics["modified_rate"])
+        val_tp_correction = float(val_metrics["tp_correction"])
+        val_fp_preservation = float(val_metrics["fp_preservation"])
+        val_auc = compute_point_auc(val_tp_correction, val_fp_preservation)
+
+    if not math.isnan(val_auc):
+        print("\n=== Force probe (val) ===")
+        print(f"Corrected token accuracy: {val_corrected_token_acc:.4f}")
+        print(f"Corrected sample accuracy: {val_corrected_sample_acc:.4f}")
+        print(f"Modified rate: {val_modified_rate:.4f}")
+        print(f"TP Correction: {val_tp_correction:.4f}")
+        print(f"FP Preservation: {val_fp_preservation:.4f}")
+        print(f"AUC: {val_auc:.4f}")
+
+    test_error_stats = base_error_stats
     if args.test_mode == "offline":
         if args.vector_steer:
             if args.model is None:
@@ -1288,8 +1581,8 @@ def main():
                 raw_model,
                 carry_model,
                 flows_test,
-                raw_layer_best,
-                inertia_layer_best,
+                raw_layer_flow_idx,
+                inertia_layer_flow_idx,
                 gt_digits_test,
                 pred_digits_test,
                 sample_ids_test,
@@ -1306,8 +1599,8 @@ def main():
                 raw_model,
                 carry_model,
                 flows_test,
-                raw_layer_best,
-                inertia_layer_best,
+                raw_layer_flow_idx,
+                inertia_layer_flow_idx,
                 gt_digits_test,
                 pred_digits_test,
                 sample_ids_test,
@@ -1320,14 +1613,22 @@ def main():
         modified_rate = float(metrics["modified_rate"])
         tp_correction = float(metrics["tp_correction"])
         fp_preservation = float(metrics["fp_preservation"])
+        test_error_stats = {
+            "orig_error_count": int(metrics["orig_error_count"]),
+            "off_by_one_count": int(metrics["off_by_one_count"]),
+            "other_error_count": int(metrics["other_error_count"]),
+            "off_by_one_ratio": float(metrics["off_by_one_ratio"]),
+            "other_error_ratio": float(metrics["other_error_ratio"]),
+            "off_by_one_confusion": metrics["off_by_one_confusion"],
+        }
     elif args.test_mode == "teacher":
         print("\nEvaluating teacher-forcing test set...")
-        corrected_token_acc, corrected_sample_acc, modified_rate, tp_correction, fp_preservation = teacher_force_eval(
+        metrics = teacher_force_eval(
             raw_model,
             carry_model,
             flows_test,
-            raw_layer_best,
-            inertia_layer_best,
+            raw_layer_flow_idx,
+            inertia_layer_flow_idx,
             gt_digits_test,
             pred_digits_test,
             sample_ids_test,
@@ -1335,6 +1636,19 @@ def main():
             args.inertia_delta,
             device,
         )
+        corrected_token_acc = float(metrics["corrected_token_acc"])
+        corrected_sample_acc = float(metrics["corrected_sample_acc"])
+        modified_rate = float(metrics["modified_rate"])
+        tp_correction = float(metrics["tp_correction"])
+        fp_preservation = float(metrics["fp_preservation"])
+        test_error_stats = {
+            "orig_error_count": int(metrics["orig_error_count"]),
+            "off_by_one_count": int(metrics["off_by_one_count"]),
+            "other_error_count": int(metrics["other_error_count"]),
+            "off_by_one_ratio": float(metrics["off_by_one_ratio"]),
+            "other_error_ratio": float(metrics["other_error_ratio"]),
+            "off_by_one_confusion": metrics["off_by_one_confusion"],
+        }
     else:
         if args.model is None:
             raise ValueError("--model is required for online test mode")
@@ -1378,7 +1692,7 @@ def main():
             online_norm_weight = norm_weight
             online_norm_eps = norm_eps
         last_layer_normalized = analyze_last_layer_normalized(lm, tokenizer)
-        corrected_token_acc, corrected_sample_acc, modified_rate, tp_correction, fp_preservation = online_force_eval(
+        online_metrics = online_force_eval(
             dataset_test,
             tokenizer,
             lm,
@@ -1397,6 +1711,19 @@ def main():
             add_unit_offset=add_unit_offset,
             use_prenorm=last_layer_normalized,
         )
+        corrected_token_acc = float(online_metrics["corrected_token_acc"])
+        corrected_sample_acc = float(online_metrics["corrected_sample_acc"])
+        modified_rate = float(online_metrics["modified_rate"])
+        tp_correction = float(online_metrics["tp_correction"])
+        fp_preservation = float(online_metrics["fp_preservation"])
+        test_error_stats = {
+            "orig_error_count": int(online_metrics["orig_error_count"]),
+            "off_by_one_count": int(online_metrics["off_by_one_count"]),
+            "other_error_count": int(online_metrics["other_error_count"]),
+            "off_by_one_ratio": float(online_metrics["off_by_one_ratio"]),
+            "other_error_ratio": float(online_metrics["other_error_ratio"]),
+            "off_by_one_confusion": online_metrics["off_by_one_confusion"],
+        }
         orig_eval_token_acc, orig_eval_sample_acc = online_baseline_eval(
             dataset_test,
             tokenizer,
@@ -1419,13 +1746,36 @@ def main():
     print(f"Modified rate: {modified_rate:.4f}")
     print(f"TP Correction: {tp_correction:.4f}")
     print(f"FP Preservation: {fp_preservation:.4f}")
+    print(
+        "Original error mix: "
+        f"off_by_one={test_error_stats['off_by_one_count']} ({test_error_stats['off_by_one_ratio']:.4f}) | "
+        f"other={test_error_stats['other_error_count']} ({test_error_stats['other_error_ratio']:.4f})"
+    )
+    for row in OFF_BY_ONE_ROWS:
+        row_counts = test_error_stats["off_by_one_confusion"][row]
+        print(
+            f"Off-by-one confusion [{row}]: "
+            f"fixed_to_gt={row_counts['fixed_to_gt']} | "
+            f"still_off_by_one={row_counts['still_off_by_one']} | "
+            f"other_wrong={row_counts['other_wrong']}"
+        )
+    test_auc = compute_point_auc(tp_correction, fp_preservation)
+    if not math.isnan(test_auc):
+        print(f"AUC: {test_auc:.4f}")
 
     payload = {
+        "seed": int(seed),
         "raw_layer": int(raw_layer_best),
         "inertia_layer": int(inertia_layer_best),
         "raw_val_acc": float(raw_val_acc),
         "carry_val_mse": float(carry_val_loss),
         "carry_val_acc_floor": float(carry_val_acc),
+        "val_corrected_token_acc": float(val_corrected_token_acc),
+        "val_corrected_sample_acc": float(val_corrected_sample_acc),
+        "val_modified_rate": float(val_modified_rate),
+        "val_tp_correction": float(val_tp_correction),
+        "val_fp_preservation": float(val_fp_preservation),
+        "val_auc": float(val_auc),
         "orig_eval_token_acc": float(orig_eval_token_acc),
         "orig_eval_sample_acc": float(orig_eval_sample_acc),
         "orig_h5_token_acc": float(orig_h5_token_acc),
@@ -1437,12 +1787,89 @@ def main():
         "modified_rate": float(modified_rate),
         "tp_correction": float(tp_correction),
         "fp_preservation": float(fp_preservation),
+        "test_auc": float(test_auc),
         "test_mode": args.test_mode,
+        "off_by_one_count": int(test_error_stats["off_by_one_count"]),
+        "other_error_count": int(test_error_stats["other_error_count"]),
+        "off_by_one_ratio": float(test_error_stats["off_by_one_ratio"]),
+        "other_error_ratio": float(test_error_stats["other_error_ratio"]),
+        "off_by_one_confusion": test_error_stats["off_by_one_confusion"],
     }
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    with open(args.output, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-    print(f"Saved metrics to {args.output}")
+    if persist_output and output_path is not None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        print(f"Saved metrics to {output_path}")
+    return payload
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Force-correction probe based on triangle consistency.")
+    parser.add_argument("--h5", type=Path, default=Path("results/plus_num3len10_Qwen3-4b/plus_num3len10_Qwen3-4b.h5"), help="Path to HDF5 results")
+    parser.add_argument("--dataset", type=Path, default=Path("num3len10-10000.pkl"), help="Dataset used for generation")
+    parser.add_argument(
+        "--layers",
+        type=str,
+        nargs=2,
+        metavar=("S_RAW_LAYER", "INERTIA_LAYER"),
+        default=[-1, -1],
+        help="Layer pair for S_raw and inertia probes; use 'none' to auto-search best layer",
+    )
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--patience", type=int, default=20)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--train-ratio", type=float, default=0.8)
+    parser.add_argument("--val-ratio", type=float, default=0.1)
+    parser.add_argument("--test-ratio", type=float, default=0.1)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--num-seeds", type=int, default=1, help="Run N consecutive seeds starting from --seed.")
+    parser.add_argument("--probe-type", type=str, choices=["linear", "mlp"], default="mlp", help="Probe architecture")
+    parser.add_argument("--positions", type=int, nargs="*", default=None, help="Positions to include; default all")
+    parser.add_argument(
+        "--sample-filter",
+        type=str,
+        choices=["all", "correct", "incorrect"],
+        default="all",
+        help="Filter tokens by model correctness: all/correct/incorrect",
+    )
+    parser.add_argument("--inertia-delta", type=float, default=0.1, help="Delta window around phi for intervention gating")
+    parser.add_argument("--vector-steer", action="store_true", help="Use vector steering instead of raw_sum+incarry correction")
+    parser.add_argument("--output", type=Path, default=None, help="Optional path to write metrics JSON")
+    parser.add_argument("--test-mode", type=str, choices=["online", "offline", "teacher"], default="online")
+    parser.add_argument("--model", type=str, default="/data/Models/Qwen3-4b")
+    parser.add_argument("--max-new-tokens", type=int, default=25)
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=10000,
+        help="Optional cap on dataset size (use first N samples)",
+    )
+    args = parser.parse_args()
+    if args.num_seeds <= 0:
+        raise ValueError("--num-seeds must be a positive integer")
+
+    output_path = resolve_output_path(args.output)
+    if args.num_seeds == 1:
+        run_single_seed(args, args.seed, output_path=output_path, persist_output=True)
+        return
+
+    seed_runs: List[Dict[str, object]] = []
+    for seed_offset in range(args.num_seeds):
+        current_seed = args.seed + seed_offset
+        seed_runs.append(run_single_seed(args, current_seed, output_path=None, persist_output=False))
+
+    aggregate_payload = {
+        "seed_start": int(args.seed),
+        "num_seeds": int(args.num_seeds),
+        "test_mode": args.test_mode,
+        "seed_runs": seed_runs,
+        "aggregate": aggregate_seed_payloads(seed_runs),
+    }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(aggregate_payload, f, ensure_ascii=False, indent=2)
+    print(f"Saved aggregated metrics to {output_path}")
 
 
 if __name__ == "__main__":

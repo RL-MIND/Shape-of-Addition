@@ -29,8 +29,11 @@ from probe_data import (
 )
 from probe_utils import (
     get_digit_token_ids,
+    inspect_teacher_layers,
     load_or_compute_teacher_features,
     online_baseline_eval,
+    resolve_teacher_final_norm_local_index,
+    resolve_selected_layers,
 )
 
 
@@ -354,6 +357,7 @@ def main() -> None:
     parser.add_argument("--test-mode", type=str, choices=["online", "offline", "teacher"], default="online")
     parser.add_argument("--model", type=str, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=25)
+    parser.add_argument("--max-samples", type=int, default=10000)
     parser.add_argument("--output", type=Path, default=None)
     args = parser.parse_args()
     args.output = resolve_output_path(args.output, args.mode)
@@ -367,6 +371,12 @@ def main() -> None:
     print(f"RMSNorm eps: {norm_eps}")
 
     dataset_full = load_dataset(args.dataset)
+    if args.max_samples is not None:
+        if args.max_samples <= 0:
+            raise ValueError("--max-samples must be a positive integer")
+        original_size = len(dataset_full)
+        dataset_full = dataset_full[: args.max_samples]
+        print(f"Using dataset subset: {len(dataset_full)}/{original_size} samples")
     h5_metrics, _ = load_h5_baseline_metrics(
         args.h5,
         args.dataset,
@@ -395,6 +405,26 @@ def main() -> None:
             do_sample=False,
         )
         last_layer_normalized = analyze_last_layer_normalized(lm_tf, tokenizer_tf)
+        teacher_total_layers, teacher_diag = inspect_teacher_layers(lm_tf, tokenizer_tf)
+        teacher_candidate_layers = parse_layer_candidates(
+            teacher_total_layers,
+            args.layers,
+            args.layer_start,
+            args.layer_end,
+        )
+        selected_teacher_layers = resolve_selected_layers(teacher_candidate_layers, teacher_total_layers)
+        print(
+            "Teacher layer diagnostics: "
+            f"config_class={teacher_diag['config_class']} | "
+            f"config.num_hidden_layers={teacher_diag['config_num_hidden_layers']} | "
+            f"text_config.num_hidden_layers={teacher_diag['text_config_num_hidden_layers']} | "
+            f"hidden_states_len={teacher_diag['hidden_states_len']} | "
+            f"layer_source={teacher_diag['layer_source']} | "
+            f"requested_layers={teacher_candidate_layers} | "
+            f"resolved_layers={selected_teacher_layers if selected_teacher_layers is not None else 'all'}"
+        )
+        if teacher_diag["forward_error"] is not None:
+            print(f"Teacher layer forward probe fallback: {teacher_diag['forward_error']}")
         flows_all, _, _, gt_digits, pred_digits, sample_ids, pos_ids = load_or_compute_teacher_features(
             dataset_full,
             dataset_path=args.dataset,
@@ -410,11 +440,15 @@ def main() -> None:
             use_prenorm=last_layer_normalized,
             valid_indices=train_ids_all.union(val_ids_all).union(test_ids_all),
             positions=args.positions,
+            max_samples=args.max_samples,
+            selected_layers=selected_teacher_layers,
         )
         del tokenizer_tf
         del lm_tf
         torch.cuda.empty_cache()
     else:
+        teacher_total_layers = None
+        selected_teacher_layers = None
         positions = load_positions(args.h5)
         flows_all, _, _, gt_digits, pred_digits, sample_ids, pos_ids = build_flat_dataset(
             dataset_full,
@@ -423,8 +457,22 @@ def main() -> None:
         )
 
     num_layers = flows_all.shape[1]
-    print(f"Applying RMSNorm to flows (last layer {num_layers - 1})...")
-    flows_all = apply_rms_norm_to_flows(flows_all, norm_weight, num_layers - 1, norm_eps)
+    if args.test_mode == "teacher":
+        norm_layer_idx = resolve_teacher_final_norm_local_index(selected_teacher_layers, teacher_total_layers)
+        if norm_layer_idx is not None:
+            print(
+                f"Applying RMSNorm to flows (teacher final layer local={norm_layer_idx}, "
+                f"global={teacher_total_layers - 1})..."
+            )
+            flows_all = apply_rms_norm_to_flows(flows_all, norm_weight, norm_layer_idx, norm_eps)
+        else:
+            print(
+                "Skipping RMSNorm on teacher flows because cached layers do not include "
+                f"the final layer {teacher_total_layers - 1}."
+            )
+    else:
+        print(f"Applying RMSNorm to flows (last layer {num_layers - 1})...")
+        flows_all = apply_rms_norm_to_flows(flows_all, norm_weight, num_layers - 1, norm_eps)
 
     train_ids, val_ids, test_ids = split_sample_ids(
         sample_ids,
@@ -452,7 +500,10 @@ def main() -> None:
     sample_ids_test = sample_ids[test_mask] if test_mask.any() else sample_ids
     sample_ids_val = sample_ids[val_mask] if val_mask.any() else sample_ids
 
-    candidate_layers = parse_layer_candidates(num_layers, args.layers, args.layer_start, args.layer_end)
+    if args.test_mode == "teacher" and selected_teacher_layers is not None:
+        candidate_layers = list(range(len(selected_teacher_layers)))
+    else:
+        candidate_layers = parse_layer_candidates(num_layers, args.layers, args.layer_start, args.layer_end)
 
     best_layer = None
     best_val_acc = -1.0
@@ -476,6 +527,12 @@ def main() -> None:
 
     if best_model is None or best_layer is None:
         raise RuntimeError("Failed to train linear probe; no layer selected")
+
+    report_layer = (
+        int(selected_teacher_layers[best_layer])
+        if args.test_mode == "teacher" and selected_teacher_layers is not None
+        else int(best_layer)
+    )
 
     if args.mode == "steer":
         lambdas = [float(x.strip()) for x in args.lambda_grid.split(",") if x.strip()]
@@ -561,7 +618,7 @@ def main() -> None:
         "method": "linear_probe",
         "mode": args.mode,
         "test_mode": args.test_mode,
-        "layer": int(best_layer),
+        "layer": report_layer,
         "val_acc": float(best_val_acc),
         "lambda": float(best_lambda),
         "val_sample_acc": float(best_val_sample_acc),
