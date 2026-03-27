@@ -179,6 +179,17 @@ def parse_digit(token: str) -> int:
     return int(token) if len(token) == 1 and token.isdigit() else -1
 
 
+def parse_bool_arg(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"无法解析布尔值: {value}")
+
+
 def set_global_seed(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -221,6 +232,70 @@ def load_sample_reference(h5f: h5py.File, dataset_path: Optional[Path]) -> Tuple
     return meta, "dataset_pickle"
 
 
+def load_position_sample_ids(pos_group: h5py.Group, row_count: int) -> np.ndarray:
+    sample_ds = pos_group.get("sample_indices")
+    if sample_ds is None:
+        sample_ds = pos_group.get("sample_ids")
+    if sample_ds is None:
+        return np.arange(row_count, dtype=np.int64)
+    return np.asarray(sample_ds[:], dtype=np.int64)
+
+
+def collect_first_error_positions(
+    h5_path: Path,
+    sample_meta: Dict[int, Dict[str, str]],
+) -> Dict[int, int]:
+    first_error_pos: Dict[int, int] = {}
+    with h5py.File(h5_path, "r") as h5f:
+        all_results = h5f.get("all_token_results")
+        if all_results is None:
+            raise RuntimeError("H5 缺少 all_token_results 组。")
+
+        numeric_positions: List[Tuple[int, str]] = []
+        for pos_name in all_results.keys():
+            if not pos_name.startswith("pos_"):
+                continue
+            pos_suffix = pos_name[4:]
+            if pos_suffix.lstrip("-").isdigit():
+                numeric_positions.append((int(pos_suffix), pos_name))
+
+        for pos, pos_name in sorted(numeric_positions, key=lambda item: item[0]):
+            pos_group = all_results[pos_name]
+            preds_ds = pos_group.get("preds")
+            gt_chars_ds = pos_group.get("gt_chars")
+            if preds_ds is None or gt_chars_ds is None:
+                continue
+
+            pred_tokens = decode_to_str_list(preds_ds[:])
+            gt_chars_h5 = decode_to_str_list(gt_chars_ds[:])
+            sample_ids = load_position_sample_ids(pos_group, len(pred_tokens))
+            max_rows = min(len(pred_tokens), len(gt_chars_h5), len(sample_ids))
+            for row_idx in range(max_rows):
+                sample_id = int(sample_ids[row_idx])
+                meta = sample_meta.get(sample_id)
+                if meta is None:
+                    continue
+
+                gt = meta["gt"]
+                if pos >= len(gt):
+                    continue
+
+                expected_gt_char = gt[pos]
+                if gt_chars_h5[row_idx] != expected_gt_char:
+                    continue
+
+                pred_digit = parse_digit(pred_tokens[row_idx])
+                gt_digit = parse_digit(expected_gt_char)
+                if pred_digit == gt_digit:
+                    continue
+
+                previous_pos = first_error_pos.get(sample_id)
+                if previous_pos is None or pos < previous_pos:
+                    first_error_pos[sample_id] = pos
+
+    return first_error_pos
+
+
 def load_position_data(
     h5_path: Path,
     pos: int,
@@ -251,14 +326,7 @@ def load_position_data(
         labels = np.asarray(pos_group["labels"][:], dtype=np.bool_)
         pred_tokens = decode_to_str_list(pos_group["preds"][:])
         gt_chars_h5 = decode_to_str_list(pos_group["gt_chars"][:])
-
-        sample_ds = pos_group.get("sample_indices")
-        if sample_ds is None:
-            sample_ds = pos_group.get("sample_ids")
-        if sample_ds is None:
-            sample_ids = np.arange(features.shape[0], dtype=np.int64)
-        else:
-            sample_ids = np.asarray(sample_ds[:], dtype=np.int64)
+        sample_ids = load_position_sample_ids(pos_group, features.shape[0])
 
     stats = {
         "rows_total": int(features.shape[0]),
@@ -582,13 +650,42 @@ def subset_meta_dict(meta: Dict[str, object], indices: np.ndarray) -> Dict[str, 
     idx = np.asarray(indices, dtype=np.int64)
     out: Dict[str, object] = {}
     for key, value in meta.items():
-        if isinstance(value, np.ndarray):
+        if isinstance(value, torch.Tensor):
+            idx_t = torch.as_tensor(idx, dtype=torch.long, device=value.device)
+            out[key] = value[idx_t]
+        elif isinstance(value, np.ndarray):
             out[key] = value[idx]
         elif isinstance(value, list):
             out[key] = [value[i] for i in idx.tolist()]
         else:
             out[key] = value
     return out
+
+
+def build_first_error_keep_mask(
+    labels: np.ndarray,
+    sample_ids: np.ndarray,
+    target_pos: int,
+    first_error_pos: Dict[int, int],
+) -> np.ndarray:
+    labels_np = np.asarray(labels, dtype=np.bool_)
+    sample_ids_np = np.asarray(sample_ids, dtype=np.int64)
+    keep = np.ones(labels_np.shape[0], dtype=np.bool_)
+    wrong_mask = ~labels_np
+    if not np.any(wrong_mask):
+        return keep
+
+    wrong_indices = np.flatnonzero(wrong_mask)
+    keep[wrong_indices] = np.asarray(
+        [first_error_pos.get(int(sample_ids_np[idx])) == target_pos for idx in wrong_indices],
+        dtype=np.bool_,
+    )
+    return keep
+
+
+def take_tensor_rows(tensor: torch.Tensor, indices: np.ndarray) -> torch.Tensor:
+    idx_t = torch.as_tensor(indices, dtype=torch.long, device=tensor.device)
+    return tensor[idx_t]
 
 
 def make_external_loader(
@@ -1040,6 +1137,84 @@ def regression_floor_distribution(values: np.ndarray) -> Dict[str, int]:
     return class_distribution(floored)
 
 
+def get_off_by_one_direction(pred_digit: int, gt_digit: int) -> Optional[str]:
+    if not (0 <= pred_digit <= 9 and 0 <= gt_digit <= 9):
+        return None
+    diff = (pred_digit - gt_digit) % 10
+    if diff == 9:
+        return "minus_one"
+    if diff == 1:
+        return "plus_one"
+    return None
+
+
+def summarize_error_type_repairs(
+    pred_digits: np.ndarray,
+    gt_digits: np.ndarray,
+    corrected_digits: np.ndarray,
+    is_correct_mask: np.ndarray,
+) -> Dict[str, object]:
+    pred_arr = np.asarray(pred_digits, dtype=np.int64)
+    gt_arr = np.asarray(gt_digits, dtype=np.int64)
+    corrected_arr = np.asarray(corrected_digits, dtype=np.int64)
+    incorrect_mask = ~np.asarray(is_correct_mask, dtype=bool)
+
+    orig_error_count = int(np.sum(incorrect_mask))
+    off_by_one_count = 0
+    off_by_one_fix_count = 0
+    other_error_count = 0
+    other_error_fix_count = 0
+
+    for idx in np.flatnonzero(incorrect_mask):
+        direction = get_off_by_one_direction(int(pred_arr[idx]), int(gt_arr[idx]))
+        is_fixed = int(corrected_arr[idx]) == int(gt_arr[idx])
+        if direction is not None:
+            off_by_one_count += 1
+            if is_fixed:
+                off_by_one_fix_count += 1
+        else:
+            other_error_count += 1
+            if is_fixed:
+                other_error_fix_count += 1
+
+    denom = orig_error_count if orig_error_count > 0 else 1
+    return {
+        "orig_error_count": int(orig_error_count),
+        "off_by_one_count": int(off_by_one_count),
+        "other_error_count": int(other_error_count),
+        "off_by_one_ratio": float(off_by_one_count / denom) if orig_error_count > 0 else 0.0,
+        "other_error_ratio": float(other_error_count / denom) if orig_error_count > 0 else 0.0,
+        "off_by_one_fix_count": int(off_by_one_fix_count),
+        "off_by_one_fix_rate": float(off_by_one_fix_count / off_by_one_count) if off_by_one_count > 0 else 0.0,
+        "other_error_fix_count": int(other_error_fix_count),
+        "other_error_fix_rate": float(other_error_fix_count / other_error_count) if other_error_count > 0 else 0.0,
+    }
+
+
+def summarize_unexplained_probe_failures(
+    split_data: PositionData,
+    corrected_digits: np.ndarray,
+) -> Dict[str, float]:
+    corrected_arr = np.asarray(corrected_digits, dtype=np.int64)
+    unexplained_count = 0
+
+    for idx in range(len(split_data)):
+        if bool(split_data.labels[idx]):
+            target_digit = int(split_data.gt_digits[idx])
+            is_unexplained = int(corrected_arr[idx]) != target_digit
+        else:
+            pred_digit = int(split_data.pred_digits[idx])
+            is_unexplained = pred_digit < 0 or int(corrected_arr[idx]) != pred_digit
+        if is_unexplained:
+            unexplained_count += 1
+
+    total = len(split_data)
+    return {
+        "count": int(unexplained_count),
+        "ratio": float(unexplained_count / total) if total > 0 else 0.0,
+    }
+
+
 def summarize_split(data: PositionData) -> Dict[str, object]:
     raw_sum_mod10 = data.raw_sum_full % 10
     return {
@@ -1058,7 +1233,7 @@ def decompose_test_errors(
     raw_pred_labels: np.ndarray,
     carry_preds_phi: np.ndarray,
     raw_sum_mod_10: bool,
-) -> Tuple[List[Dict[str, object]], Dict[str, int]]:
+) -> Tuple[List[Dict[str, object]], Dict[str, int], np.ndarray]:
     rows: List[Dict[str, object]] = []
     counts = {bucket: 0 for bucket in BUCKET_ORDER}
     counts["correct"] = 0
@@ -1070,11 +1245,15 @@ def decompose_test_errors(
     raw_hat_mod = raw_hat_labels % 10
     carry_gt = np.floor(np.maximum(test_data.c_potential, 0.0)).astype(np.int64)
     carry_hat = np.floor(np.maximum(carry_preds_phi, 0.0)).astype(np.int64)
+    corrected_digits = (raw_hat_mod + carry_hat) % 10
 
     for idx in range(len(test_data)):
         is_correct = bool(test_data.labels[idx])
         pred_digit = int(test_data.pred_digits[idx])
-        explained_digit = int((raw_hat_mod[idx] + carry_hat[idx]) % 10)
+        explained_digit = int(corrected_digits[idx])
+        off_by_one_direction = None if is_correct else get_off_by_one_direction(pred_digit, int(test_data.gt_digits[idx]))
+        error_type = "correct" if is_correct else ("off_by_one" if off_by_one_direction is not None else "other_error")
+        probe_fixed_to_gt = int((not is_correct) and explained_digit == int(test_data.gt_digits[idx]))
 
         if is_correct:
             bucket = "correct"
@@ -1105,6 +1284,8 @@ def decompose_test_errors(
                 "pred_token": test_data.pred_tokens[idx],
                 "pred_digit": pred_digit,
                 "is_correct": int(is_correct),
+                "error_type": error_type,
+                "off_by_one_direction": off_by_one_direction,
                 "raw_gt_full": int(raw_gt_full[idx]),
                 "raw_gt_mod10": int(raw_gt_mod[idx]),
                 "raw_gt_label": int(raw_gt_labels[idx]),
@@ -1116,11 +1297,12 @@ def decompose_test_errors(
                 "carry_gt": int(carry_gt[idx]),
                 "carry_hat": int(carry_hat[idx]),
                 "probe_explained_digit": explained_digit,
+                "probe_fixed_to_gt": probe_fixed_to_gt,
                 "bucket": bucket,
             }
         )
 
-    return rows, counts
+    return rows, counts, corrected_digits
 
 
 def write_csv(rows: List[Dict[str, object]], path: Path) -> None:
@@ -1184,6 +1366,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--raw-sum-mod-10", action="store_true", help="将 raw-sum probe 改为 10 分类（raw_sum mod 10）。")
     parser.add_argument("--train-on-correct", action="store_true", help="按 Y:/vertical-flow/classifier.py 的口径，仅使用 correct-only 样本池切分 train/val 并训练 probe。")
     parser.add_argument("--correct-train-ratio", type=float, default=DEFAULT_CORRECT_TRAIN_RATIO, help="开启 --train-on-correct 时，正确样本中分给 train 的比例，其余进入 val。")
+    parser.add_argument(
+        "--first-error",
+        type=parse_bool_arg,
+        nargs="?",
+        const=True,
+        default=True,
+        help="是否仅保留目标位置为该样本首个错误的位置，默认 true。",
+    )
     return parser
 
 
@@ -1273,6 +1463,62 @@ def main() -> None:
     if not torch.equal(raw_position_indices_unbalanced, carry_position_indices_unbalanced):
         raise RuntimeError("raw-sum 与 carry 的 position_indices 不一致。")
 
+    raw_data_alignment = build_position_data_from_processed(
+        features=select_layer_features(raw_X_unbalanced, seq_len, feature_dim, args.layer),
+        y_binary=raw_y_binary_unbalanced,
+        raw_labels=raw_y_unbalanced,
+        carry_labels=torch.tensor(
+            [
+                flow_utils_module.compute_c_potential(sample_meta[int(sample_id)]["question"], args.pos)
+                for sample_id in raw_sample_ids_unbalanced.detach().cpu().numpy().tolist()
+            ],
+            dtype=torch.float32,
+        ),
+        sample_idx_all=raw_sample_ids_unbalanced,
+        meta=raw_meta_unbalanced,
+        sample_meta=sample_meta,
+        pos=args.pos,
+    )
+    total_rows = load_h5_position_row_count(args.h5, args.pos)
+    mismatch_count = int((~raw_data_alignment.gt_char_match).sum())
+    target_result_len = pick_target_result_len(raw_data_alignment.result_lens)
+    dropped_by_result_len = int(total_rows - len(raw_data_alignment))
+    pre_balance_rows = len(raw_data_alignment)
+    pre_balance_correct = int(raw_data_alignment.labels.sum())
+    pre_balance_wrong = int((~raw_data_alignment.labels).sum())
+
+    if args.first_error:
+        first_error_pos = collect_first_error_positions(args.h5, sample_meta)
+        first_error_keep = build_first_error_keep_mask(
+            labels=raw_data_alignment.labels,
+            sample_ids=raw_data_alignment.sample_ids,
+            target_pos=args.pos,
+            first_error_pos=first_error_pos,
+        )
+        kept_after_first_error = int(first_error_keep.sum())
+        dropped_after_first_error = int((~first_error_keep).sum())
+        print(
+            "Applying first-error filter: "
+            f"kept={kept_after_first_error} | dropped={dropped_after_first_error} | target_pos={args.pos}"
+        )
+        if kept_after_first_error == 0:
+            raise RuntimeError("开启 --first-error 后没有剩余样本。")
+
+        first_error_indices = np.flatnonzero(first_error_keep)
+        raw_X_unbalanced = take_tensor_rows(raw_X_unbalanced, first_error_indices)
+        raw_y_unbalanced = take_tensor_rows(raw_y_unbalanced, first_error_indices)
+        raw_y_binary_unbalanced = take_tensor_rows(raw_y_binary_unbalanced, first_error_indices)
+        raw_position_indices_unbalanced = take_tensor_rows(raw_position_indices_unbalanced, first_error_indices)
+        raw_sample_ids_unbalanced = take_tensor_rows(raw_sample_ids_unbalanced, first_error_indices)
+        raw_meta_unbalanced = subset_meta_dict(raw_meta_unbalanced, first_error_indices)
+
+        carry_X_unbalanced = take_tensor_rows(carry_X_unbalanced, first_error_indices)
+        carry_y_unbalanced = take_tensor_rows(carry_y_unbalanced, first_error_indices)
+        carry_y_binary_unbalanced = take_tensor_rows(carry_y_binary_unbalanced, first_error_indices)
+        carry_position_indices_unbalanced = take_tensor_rows(carry_position_indices_unbalanced, first_error_indices)
+        carry_sample_ids_unbalanced = take_tensor_rows(carry_sample_ids_unbalanced, first_error_indices)
+        carry_meta_unbalanced = subset_meta_dict(carry_meta_unbalanced, first_error_indices)
+
     effective_balance_mode = "none" if args.train_on_correct else CURRENT_BALANCE_MODE
 
     if effective_balance_mode == "strong":
@@ -1292,37 +1538,19 @@ def main() -> None:
     else:
         raise RuntimeError(f"不支持的 balance_mode: {effective_balance_mode}")
 
-    kept_indices_t = torch.from_numpy(kept_indices.astype(np.int64))
-    raw_X_balanced = raw_X_unbalanced[kept_indices_t]
-    raw_y_balanced = raw_y_unbalanced[kept_indices_t]
-    raw_y_binary_balanced = raw_y_binary_unbalanced[kept_indices_t]
-    raw_position_indices = raw_position_indices_unbalanced[kept_indices_t]
-    raw_sample_ids_balanced = raw_sample_ids_unbalanced[kept_indices_t]
+    raw_X_balanced = take_tensor_rows(raw_X_unbalanced, kept_indices)
+    raw_y_balanced = take_tensor_rows(raw_y_unbalanced, kept_indices)
+    raw_y_binary_balanced = take_tensor_rows(raw_y_binary_unbalanced, kept_indices)
+    raw_position_indices = take_tensor_rows(raw_position_indices_unbalanced, kept_indices)
+    raw_sample_ids_balanced = take_tensor_rows(raw_sample_ids_unbalanced, kept_indices)
     raw_meta_balanced = subset_meta_dict(raw_meta_unbalanced, kept_indices)
 
-    carry_X_balanced = carry_X_unbalanced[kept_indices_t]
-    carry_y_balanced = carry_y_unbalanced[kept_indices_t]
-    carry_y_binary_balanced = carry_y_binary_unbalanced[kept_indices_t]
-    carry_position_indices = carry_position_indices_unbalanced[kept_indices_t]
-    carry_sample_ids_balanced = carry_sample_ids_unbalanced[kept_indices_t]
+    carry_X_balanced = take_tensor_rows(carry_X_unbalanced, kept_indices)
+    carry_y_balanced = take_tensor_rows(carry_y_unbalanced, kept_indices)
+    carry_y_binary_balanced = take_tensor_rows(carry_y_binary_unbalanced, kept_indices)
+    carry_position_indices = take_tensor_rows(carry_position_indices_unbalanced, kept_indices)
+    carry_sample_ids_balanced = take_tensor_rows(carry_sample_ids_unbalanced, kept_indices)
     carry_meta_balanced = subset_meta_dict(carry_meta_unbalanced, kept_indices)
-
-    raw_data_unbalanced = build_position_data_from_processed(
-        features=select_layer_features(raw_X_unbalanced, seq_len, feature_dim, args.layer),
-        y_binary=raw_y_binary_unbalanced,
-        raw_labels=raw_y_unbalanced,
-        carry_labels=torch.tensor(
-            [
-                flow_utils_module.compute_c_potential(sample_meta[int(sample_id)]["question"], args.pos)
-                for sample_id in raw_sample_ids_unbalanced.detach().cpu().numpy().tolist()
-            ],
-            dtype=torch.float32,
-        ),
-        sample_idx_all=raw_sample_ids_unbalanced,
-        meta=raw_meta_unbalanced,
-        sample_meta=sample_meta,
-        pos=args.pos,
-    )
     if not torch.equal(raw_y_binary_balanced, carry_y_binary_balanced):
         raise RuntimeError("平衡后 raw-sum 与 carry 的 y_binary 不一致。")
     if not torch.equal(raw_sample_ids_balanced, carry_sample_ids_balanced):
@@ -1337,14 +1565,6 @@ def main() -> None:
         sample_meta=sample_meta,
         pos=args.pos,
     )
-
-    total_rows = load_h5_position_row_count(args.h5, args.pos)
-    mismatch_count = int((~raw_data_unbalanced.gt_char_match).sum())
-    target_result_len = pick_target_result_len(raw_data_unbalanced.result_lens)
-    dropped_by_result_len = int(total_rows - len(raw_data_unbalanced))
-    pre_balance_rows = len(raw_data_unbalanced)
-    pre_balance_correct = int(raw_data_unbalanced.labels.sum())
-    pre_balance_wrong = int((~raw_data_unbalanced.labels).sum())
 
     print(
         "Filtered rows: "
@@ -1608,12 +1828,36 @@ def main() -> None:
         test_preds=carry_test_preds,
     )
 
+    if len(X_raw_fit_val) > 0 and len(X_carry_fit_val) > 0:
+        raw_val_preds, _ = predict_with_external_classifier(
+            raw_model,
+            X_raw_fit_val,
+            batch_size=args.batch_size,
+            device=device,
+        )
+        carry_val_preds = predict_with_external_regressor(
+            carry_model,
+            X_carry_fit_val,
+            batch_size=args.batch_size,
+            device=device,
+        )
+        val_corrected_digits = (raw_val_preds % 10 + np.floor(np.maximum(carry_val_preds, 0.0)).astype(np.int64)) % 10
+    else:
+        val_corrected_digits = np.zeros(0, dtype=np.int64)
+    val_unexplained_stats = summarize_unexplained_probe_failures(val_data, val_corrected_digits)
+
     raw_test_mod10_acc = float(np.mean((raw_probe.test_preds % 10) == (test_data.raw_sum_full % 10)))
-    error_rows, bucket_counts = decompose_test_errors(
+    error_rows, bucket_counts, corrected_test_digits = decompose_test_errors(
         test_data=test_data,
         raw_pred_labels=raw_probe.test_preds,
         carry_preds_phi=carry_probe.test_preds,
         raw_sum_mod_10=args.raw_sum_mod_10,
+    )
+    error_type_stats = summarize_error_type_repairs(
+        pred_digits=test_data.pred_digits,
+        gt_digits=test_data.gt_digits,
+        corrected_digits=corrected_test_digits,
+        is_correct_mask=test_data.labels,
     )
 
     incorrect_test_count = int((~test_data.labels).sum())
@@ -1700,6 +1944,8 @@ def main() -> None:
             "raw_fit_val_rows": int(len(X_raw_fit_val)),
             "carry_fit_train_rows": int(len(X_carry_fit_train)),
             "carry_fit_val_rows": int(len(X_carry_fit_val)),
+            "val_unexplained_probe_failure_count": int(val_unexplained_stats["count"]),
+            "val_unexplained_probe_failure_ratio": float(val_unexplained_stats["ratio"]),
         },
         "raw_sum_probe": {
             "target": "raw_sum_classify",
@@ -1743,7 +1989,18 @@ def main() -> None:
         "error_decomposition": {
             "test_count": int(test_count),
             "incorrect_test_count": incorrect_test_count,
+            "val_unexplained_probe_failure_count": int(val_unexplained_stats["count"]),
+            "val_unexplained_probe_failure_ratio": float(val_unexplained_stats["ratio"]),
+            "orig_error_count": int(error_type_stats["orig_error_count"]),
             "correct_test_count": int(bucket_counts.get("correct", 0)),
+            "off_by_one_count": int(error_type_stats["off_by_one_count"]),
+            "other_error_count": int(error_type_stats["other_error_count"]),
+            "off_by_one_ratio": float(error_type_stats["off_by_one_ratio"]),
+            "other_error_ratio": float(error_type_stats["other_error_ratio"]),
+            "off_by_one_fix_count": int(error_type_stats["off_by_one_fix_count"]),
+            "off_by_one_fix_rate": float(error_type_stats["off_by_one_fix_rate"]),
+            "other_error_fix_count": int(error_type_stats["other_error_fix_count"]),
+            "other_error_fix_rate": float(error_type_stats["other_error_fix_rate"]),
             "bucket_counts": {k: int(bucket_counts.get(k, 0)) for k in BUCKET_ORDER},
             "bucket_pct_of_test": bucket_pct_of_test,
             "bucket_pct_of_incorrect": bucket_pct_of_incorrect,
@@ -1763,11 +2020,16 @@ def main() -> None:
         f"raw_test_acc={raw_probe.test_metrics['acc']:.4f} | "
         f"raw_test_mod10_acc={raw_test_mod10_acc:.4f} | "
         f"carry_test_floor_acc={carry_probe.test_metrics['floor_acc']:.4f} | "
+        f"val_unexplained_probe_failure={int(val_unexplained_stats['count'])} ({float(val_unexplained_stats['ratio']):.4f}) | "
         f"carry_wrong_raw_correct={bucket_counts.get('carry_wrong_raw_correct', 0)} ({bucket_pct_of_test.get('carry_wrong_raw_correct', 0.0):.4f}) | "
         f"raw_wrong_carry_correct={bucket_counts.get('raw_wrong_carry_correct', 0)} ({bucket_pct_of_test.get('raw_wrong_carry_correct', 0.0):.4f}) | "
         f"both_wrong={bucket_counts.get('both_wrong', 0)} ({bucket_pct_of_test.get('both_wrong', 0.0):.4f}) | "
         f"unexplained_probe_failure={bucket_counts.get('unexplained_probe_failure', 0)} ({bucket_pct_of_test.get('unexplained_probe_failure', 0.0):.4f}) | "
-        f"internal_anomaly={bucket_counts.get('internal_anomaly', 0)} ({bucket_pct_of_test.get('internal_anomaly', 0.0):.4f})"
+        f"internal_anomaly={bucket_counts.get('internal_anomaly', 0)} ({bucket_pct_of_test.get('internal_anomaly', 0.0):.4f}) | "
+        f"off_by_one={error_type_stats['off_by_one_count']} ({error_type_stats['off_by_one_ratio']:.4f}) | "
+        f"off_by_one_fixed={error_type_stats['off_by_one_fix_count']} ({error_type_stats['off_by_one_fix_rate']:.4f}) | "
+        f"other_error={error_type_stats['other_error_count']} ({error_type_stats['other_error_ratio']:.4f}) | "
+        f"other_fixed={error_type_stats['other_error_fix_count']} ({error_type_stats['other_error_fix_rate']:.4f})"
     )
 
 
