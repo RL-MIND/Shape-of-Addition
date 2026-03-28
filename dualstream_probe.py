@@ -15,6 +15,8 @@ from model_utils import apply_chat_template_safe, detect_model_type, get_norm_we
 
 from probe_data import (
     build_flat_dataset,
+    compute_c_potential,
+    compute_raw_sum,
     compute_token_sample_acc,
     load_dataset,
     load_h5_baseline_metrics,
@@ -175,6 +177,16 @@ def aggregate_seed_payloads(seed_payloads: List[Dict[str, object]]) -> Dict[str,
         "orig_sample_acc",
         "corrected_token_acc",
         "corrected_sample_acc",
+        "raw_probe_true_carry_token_acc",
+        "raw_probe_true_carry_sample_acc",
+        "raw_probe_true_carry_modified_rate",
+        "raw_probe_true_carry_tp_correction",
+        "raw_probe_true_carry_fp_preservation",
+        "carry_probe_true_raw_token_acc",
+        "carry_probe_true_raw_sample_acc",
+        "carry_probe_true_raw_modified_rate",
+        "carry_probe_true_raw_tp_correction",
+        "carry_probe_true_raw_fp_preservation",
         "modified_rate",
         "tp_correction",
         "fp_preservation",
@@ -788,7 +800,16 @@ def online_force_eval(
     norm_eps: float = 1e-6,
     add_unit_offset: bool = False,
     use_prenorm: bool = False,
+    raw_source: str = "probe",
+    carry_source: str = "probe",
 ) -> Dict[str, object]:
+    if raw_source not in ("probe", "oracle"):
+        raise ValueError(f"Unsupported raw_source: {raw_source}")
+    if carry_source not in ("probe", "oracle"):
+        raise ValueError(f"Unsupported carry_source: {carry_source}")
+    if vector_steer and (raw_source != "probe" or carry_source != "probe"):
+        raise ValueError("vector_steer only supports raw_source='probe' and carry_source='probe'")
+
     digit_id_list, digit_val_list = get_digit_token_ids(tokenizer)
 
     # 用于捕获 pre-norm hidden states 的容器和 hook
@@ -847,10 +868,10 @@ def online_force_eval(
             gt_val = sum(operands)
             gt_str = str(gt_val)
 
-            expr = " + ".join(str(x) for x in operands)
-            messages = [{"role": "user", "content": f"Calculate {expr}. Only output a number."}]
+            question = " + ".join(str(x) for x in operands)
+            messages = [{"role": "user", "content": f"Calculate {question}. Only output a number."}]
             text = apply_chat_template_safe(tokenizer, messages)
-            text = text + expr + " = "
+            text = text + question + " = "
 
             model_inputs = tokenizer([text], return_tensors="pt").to(device)
             # 清空 pre-norm 捕获（每个样本开始前）
@@ -915,8 +936,21 @@ def online_force_eval(
                     raw_h = raw_h.to(dtype=raw_dtype)
                 if inertia_h.dtype != carry_dtype:
                     inertia_h = inertia_h.to(dtype=carry_dtype)
-                raw_hat = int(torch.argmax(raw_model(raw_h), dim=1).item())
-                carry_pred_val = float(carry_model(inertia_h).squeeze(1).item())
+                current_pos = len(generated_digits)
+                raw_probe_hat = int(torch.argmax(raw_model(raw_h), dim=1).item())
+                carry_probe_pred_val = float(carry_model(inertia_h).squeeze(1).item())
+
+                if raw_source == "oracle":
+                    raw_sum_val = compute_raw_sum(question, current_pos)
+                    raw_hat = int(raw_sum_val % 10) if raw_sum_val >= 0 else raw_probe_hat
+                else:
+                    raw_hat = raw_probe_hat
+
+                if carry_source == "oracle":
+                    carry_pred_val = float(compute_c_potential(question, current_pos))
+                else:
+                    carry_pred_val = carry_probe_pred_val
+
                 intervene = should_intervene(raw_hat, carry_pred_val, d_pred)
                 if intervene and vector_steer and dir01 is not None and dir12 is not None and lm_head is not None:
                     pred_carry = int((d_pred - raw_hat) % 10)
@@ -1495,6 +1529,16 @@ def run_single_seed(
     val_tp_correction = float("nan")
     val_fp_preservation = float("nan")
     val_auc = float("nan")
+    raw_probe_true_carry_token_acc = float("nan")
+    raw_probe_true_carry_sample_acc = float("nan")
+    raw_probe_true_carry_modified_rate = float("nan")
+    raw_probe_true_carry_tp_correction = float("nan")
+    raw_probe_true_carry_fp_preservation = float("nan")
+    carry_probe_true_raw_token_acc = float("nan")
+    carry_probe_true_raw_sample_acc = float("nan")
+    carry_probe_true_raw_modified_rate = float("nan")
+    carry_probe_true_raw_tp_correction = float("nan")
+    carry_probe_true_raw_fp_preservation = float("nan")
 
     if args.test_mode == "teacher":
         val_metrics = teacher_force_eval(
@@ -1724,6 +1768,56 @@ def run_single_seed(
             "other_error_ratio": float(online_metrics["other_error_ratio"]),
             "off_by_one_confusion": online_metrics["off_by_one_confusion"],
         }
+        if not args.vector_steer:
+            raw_probe_true_carry_metrics = online_force_eval(
+                dataset_test,
+                tokenizer,
+                lm,
+                raw_model,
+                carry_model,
+                raw_layer_best,
+                inertia_layer_best,
+                args.max_new_tokens,
+                args.inertia_delta,
+                device,
+                vector_steer=False,
+                norm_weight=online_norm_weight,
+                norm_eps=online_norm_eps,
+                add_unit_offset=add_unit_offset,
+                use_prenorm=last_layer_normalized,
+                raw_source="probe",
+                carry_source="oracle",
+            )
+            raw_probe_true_carry_token_acc = float(raw_probe_true_carry_metrics["corrected_token_acc"])
+            raw_probe_true_carry_sample_acc = float(raw_probe_true_carry_metrics["corrected_sample_acc"])
+            raw_probe_true_carry_modified_rate = float(raw_probe_true_carry_metrics["modified_rate"])
+            raw_probe_true_carry_tp_correction = float(raw_probe_true_carry_metrics["tp_correction"])
+            raw_probe_true_carry_fp_preservation = float(raw_probe_true_carry_metrics["fp_preservation"])
+
+            carry_probe_true_raw_metrics = online_force_eval(
+                dataset_test,
+                tokenizer,
+                lm,
+                raw_model,
+                carry_model,
+                raw_layer_best,
+                inertia_layer_best,
+                args.max_new_tokens,
+                args.inertia_delta,
+                device,
+                vector_steer=False,
+                norm_weight=online_norm_weight,
+                norm_eps=online_norm_eps,
+                add_unit_offset=add_unit_offset,
+                use_prenorm=last_layer_normalized,
+                raw_source="oracle",
+                carry_source="probe",
+            )
+            carry_probe_true_raw_token_acc = float(carry_probe_true_raw_metrics["corrected_token_acc"])
+            carry_probe_true_raw_sample_acc = float(carry_probe_true_raw_metrics["corrected_sample_acc"])
+            carry_probe_true_raw_modified_rate = float(carry_probe_true_raw_metrics["modified_rate"])
+            carry_probe_true_raw_tp_correction = float(carry_probe_true_raw_metrics["tp_correction"])
+            carry_probe_true_raw_fp_preservation = float(carry_probe_true_raw_metrics["fp_preservation"])
         orig_eval_token_acc, orig_eval_sample_acc = online_baseline_eval(
             dataset_test,
             tokenizer,
@@ -1762,6 +1856,30 @@ def run_single_seed(
     test_auc = compute_point_auc(tp_correction, fp_preservation)
     if not math.isnan(test_auc):
         print(f"AUC: {test_auc:.4f}")
+    if args.test_mode == "online" and not args.vector_steer:
+        print("\n=== Online Ablation Study ===")
+        print(
+            "Dualstream (probe+probe): "
+            f"token_acc={corrected_token_acc:.4f} | sample_acc={corrected_sample_acc:.4f} | "
+            f"modified_rate={modified_rate:.4f} | tp_correction={tp_correction:.4f} | "
+            f"fp_preservation={fp_preservation:.4f}"
+        )
+        print(
+            "Raw probe + true carry: "
+            f"token_acc={raw_probe_true_carry_token_acc:.4f} | "
+            f"sample_acc={raw_probe_true_carry_sample_acc:.4f} | "
+            f"modified_rate={raw_probe_true_carry_modified_rate:.4f} | "
+            f"tp_correction={raw_probe_true_carry_tp_correction:.4f} | "
+            f"fp_preservation={raw_probe_true_carry_fp_preservation:.4f}"
+        )
+        print(
+            "Carry probe + true raw-sum: "
+            f"token_acc={carry_probe_true_raw_token_acc:.4f} | "
+            f"sample_acc={carry_probe_true_raw_sample_acc:.4f} | "
+            f"modified_rate={carry_probe_true_raw_modified_rate:.4f} | "
+            f"tp_correction={carry_probe_true_raw_tp_correction:.4f} | "
+            f"fp_preservation={carry_probe_true_raw_fp_preservation:.4f}"
+        )
 
     payload = {
         "seed": int(seed),
@@ -1784,6 +1902,16 @@ def run_single_seed(
         "orig_sample_acc": float(orig_h5_sample_acc),
         "corrected_token_acc": float(corrected_token_acc),
         "corrected_sample_acc": float(corrected_sample_acc),
+        "raw_probe_true_carry_token_acc": float(raw_probe_true_carry_token_acc),
+        "raw_probe_true_carry_sample_acc": float(raw_probe_true_carry_sample_acc),
+        "raw_probe_true_carry_modified_rate": float(raw_probe_true_carry_modified_rate),
+        "raw_probe_true_carry_tp_correction": float(raw_probe_true_carry_tp_correction),
+        "raw_probe_true_carry_fp_preservation": float(raw_probe_true_carry_fp_preservation),
+        "carry_probe_true_raw_token_acc": float(carry_probe_true_raw_token_acc),
+        "carry_probe_true_raw_sample_acc": float(carry_probe_true_raw_sample_acc),
+        "carry_probe_true_raw_modified_rate": float(carry_probe_true_raw_modified_rate),
+        "carry_probe_true_raw_tp_correction": float(carry_probe_true_raw_tp_correction),
+        "carry_probe_true_raw_fp_preservation": float(carry_probe_true_raw_fp_preservation),
         "modified_rate": float(modified_rate),
         "tp_correction": float(tp_correction),
         "fp_preservation": float(fp_preservation),
@@ -1833,7 +1961,7 @@ def main():
         default="all",
         help="Filter tokens by model correctness: all/correct/incorrect",
     )
-    parser.add_argument("--inertia-delta", type=float, default=0.1, help="Delta window around phi for intervention gating")
+    parser.add_argument("--inertia-delta", type=float, default=0, help="Delta window around phi for intervention gating")
     parser.add_argument("--vector-steer", action="store_true", help="Use vector steering instead of raw_sum+incarry correction")
     parser.add_argument("--output", type=Path, default=None, help="Optional path to write metrics JSON")
     parser.add_argument("--test-mode", type=str, choices=["online", "offline", "teacher"], default="online")

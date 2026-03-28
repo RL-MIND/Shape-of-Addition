@@ -43,11 +43,10 @@ DEFAULT_MLP_DROPOUT = 0.2
 EXTERNAL_VERTICAL_FLOW_DIR = Path("/home/wenliuyuan/vertical-flow")
 
 BUCKET_ORDER = [
-    "carry_wrong_raw_correct",
+    "both_correct",
+    "raw_correct_carry_wrong",
     "raw_wrong_carry_correct",
     "both_wrong",
-    "unexplained_probe_failure",
-    "internal_anomaly",
 ]
 
 
@@ -1148,6 +1147,53 @@ def get_off_by_one_direction(pred_digit: int, gt_digit: int) -> Optional[str]:
     return None
 
 
+def make_empty_error_bucket_stats() -> Dict[str, Dict[str, float]]:
+    return {
+        bucket: {
+            "count": 0,
+            "ratio": 0.0,
+            "fixed_count": 0,
+            "fixed_rate": 0.0,
+        }
+        for bucket in BUCKET_ORDER
+    }
+
+
+def compute_corrected_digits_with_inertia_delta(
+    raw_pred_labels: np.ndarray,
+    carry_preds_phi: np.ndarray,
+    pred_digits: np.ndarray,
+    inertia_delta: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    raw_hat_labels = np.asarray(raw_pred_labels, dtype=np.int64)
+    raw_hat_mod = raw_hat_labels % 10
+    carry_phi = np.maximum(np.asarray(carry_preds_phi, dtype=np.float32), 0.0)
+    carry_hat = np.floor(carry_phi).astype(np.int64)
+    pred_arr = np.asarray(pred_digits, dtype=np.int64)
+    corrected_digits = np.empty_like(raw_hat_mod, dtype=np.int64)
+
+    for idx in range(raw_hat_mod.shape[0]):
+        raw_d = int(raw_hat_mod[idx])
+        phi = float(carry_phi[idx])
+        pred_digit = int(pred_arr[idx]) if 0 <= pred_arr[idx] <= 9 else -1
+
+        low = math.floor(phi - inertia_delta)
+        high = math.floor(phi + inertia_delta)
+        intervene = True
+        if pred_digit != -1:
+            for carry_candidate in range(low, high + 1):
+                if (raw_d + carry_candidate) % 10 == pred_digit:
+                    intervene = False
+                    break
+
+        if intervene:
+            corrected_digits[idx] = (raw_d + int(carry_hat[idx])) % 10
+        else:
+            corrected_digits[idx] = pred_digit if pred_digit != -1 else (raw_d + int(carry_hat[idx])) % 10
+
+    return corrected_digits, carry_hat
+
+
 def summarize_error_type_repairs(
     pred_digits: np.ndarray,
     gt_digits: np.ndarray,
@@ -1191,28 +1237,64 @@ def summarize_error_type_repairs(
     }
 
 
-def summarize_unexplained_probe_failures(
-    split_data: PositionData,
-    corrected_digits: np.ndarray,
-) -> Dict[str, float]:
-    corrected_arr = np.asarray(corrected_digits, dtype=np.int64)
-    unexplained_count = 0
-
-    for idx in range(len(split_data)):
-        if bool(split_data.labels[idx]):
-            target_digit = int(split_data.gt_digits[idx])
-            is_unexplained = int(corrected_arr[idx]) != target_digit
-        else:
-            pred_digit = int(split_data.pred_digits[idx])
-            is_unexplained = pred_digit < 0 or int(corrected_arr[idx]) != pred_digit
-        if is_unexplained:
-            unexplained_count += 1
-
-    total = len(split_data)
-    return {
-        "count": int(unexplained_count),
-        "ratio": float(unexplained_count / total) if total > 0 else 0.0,
+def summarize_error_type_bucket_stats(
+    rows: List[Dict[str, object]],
+) -> Dict[str, Dict[str, Dict[str, float]]]:
+    stats = {
+        "off_by_one_bucket_stats": make_empty_error_bucket_stats(),
+        "other_error_bucket_stats": make_empty_error_bucket_stats(),
     }
+    totals = {
+        "off_by_one_bucket_stats": 0,
+        "other_error_bucket_stats": 0,
+    }
+
+    for row in rows:
+        if int(row["is_correct"]) != 0:
+            continue
+        error_type = str(row["error_type"])
+        bucket = str(row["bucket"])
+        if bucket not in BUCKET_ORDER:
+            continue
+        if error_type == "off_by_one":
+            stat_key = "off_by_one_bucket_stats"
+        elif error_type == "other_error":
+            stat_key = "other_error_bucket_stats"
+        else:
+            continue
+
+        bucket_stats = stats[stat_key][bucket]
+        bucket_stats["count"] += 1
+        totals[stat_key] += 1
+        if int(row["probe_fixed_to_gt"]) == 1:
+            bucket_stats["fixed_count"] += 1
+
+    for stat_key, bucket_stats in stats.items():
+        total_count = totals[stat_key]
+        denom = total_count if total_count > 0 else 1
+        for bucket in BUCKET_ORDER:
+            bucket_count = int(bucket_stats[bucket]["count"])
+            fixed_count = int(bucket_stats[bucket]["fixed_count"])
+            bucket_stats[bucket]["count"] = bucket_count
+            bucket_stats[bucket]["ratio"] = float(bucket_count / denom) if total_count > 0 else 0.0
+            bucket_stats[bucket]["fixed_count"] = fixed_count
+            bucket_stats[bucket]["fixed_rate"] = float(fixed_count / bucket_count) if bucket_count > 0 else 0.0
+
+    return stats
+
+
+def format_error_bucket_stats(
+    label: str,
+    bucket_stats: Dict[str, Dict[str, float]],
+) -> str:
+    parts = []
+    for bucket in BUCKET_ORDER:
+        stats = bucket_stats[bucket]
+        parts.append(
+            f"{bucket}={int(stats['count'])} ({float(stats['ratio']):.4f}), "
+            f"fixed={int(stats['fixed_count'])} ({float(stats['fixed_rate']):.4f})"
+        )
+    return f"{label}: " + " | ".join(parts)
 
 
 def summarize_split(data: PositionData) -> Dict[str, object]:
@@ -1233,6 +1315,7 @@ def decompose_test_errors(
     raw_pred_labels: np.ndarray,
     carry_preds_phi: np.ndarray,
     raw_sum_mod_10: bool,
+    inertia_delta: float,
 ) -> Tuple[List[Dict[str, object]], Dict[str, int], np.ndarray]:
     rows: List[Dict[str, object]] = []
     counts = {bucket: 0 for bucket in BUCKET_ORDER}
@@ -1242,10 +1325,14 @@ def decompose_test_errors(
     raw_gt_mod = raw_gt_full % 10
     raw_gt_labels = raw_gt_mod if raw_sum_mod_10 else raw_gt_full
     raw_hat_labels = np.asarray(raw_pred_labels, dtype=np.int64)
-    raw_hat_mod = raw_hat_labels % 10
     carry_gt = np.floor(np.maximum(test_data.c_potential, 0.0)).astype(np.int64)
-    carry_hat = np.floor(np.maximum(carry_preds_phi, 0.0)).astype(np.int64)
-    corrected_digits = (raw_hat_mod + carry_hat) % 10
+    raw_hat_mod = raw_hat_labels % 10
+    corrected_digits, carry_hat = compute_corrected_digits_with_inertia_delta(
+        raw_pred_labels=raw_hat_labels,
+        carry_preds_phi=carry_preds_phi,
+        pred_digits=test_data.pred_digits,
+        inertia_delta=inertia_delta,
+    )
 
     for idx in range(len(test_data)):
         is_correct = bool(test_data.labels[idx])
@@ -1258,20 +1345,16 @@ def decompose_test_errors(
         if is_correct:
             bucket = "correct"
         else:
-            probe_explained = pred_digit >= 0 and pred_digit == explained_digit
-            if not probe_explained:
-                bucket = "unexplained_probe_failure"
+            raw_ok = int(raw_hat_labels[idx]) == int(raw_gt_labels[idx])
+            carry_ok = int(carry_hat[idx]) == int(carry_gt[idx])
+            if raw_ok and carry_ok:
+                bucket = "both_correct"
+            elif raw_ok:
+                bucket = "raw_correct_carry_wrong"
+            elif carry_ok:
+                bucket = "raw_wrong_carry_correct"
             else:
-                raw_ok = int(raw_hat_labels[idx]) == int(raw_gt_labels[idx])
-                carry_ok = int(carry_hat[idx]) == int(carry_gt[idx])
-                if raw_ok and carry_ok:
-                    bucket = "internal_anomaly"
-                elif raw_ok and not carry_ok:
-                    bucket = "carry_wrong_raw_correct"
-                elif (not raw_ok) and carry_ok:
-                    bucket = "raw_wrong_carry_correct"
-                else:
-                    bucket = "both_wrong"
+                bucket = "both_wrong"
 
         counts[bucket] = counts.get(bucket, 0) + 1
         rows.append(
@@ -1364,7 +1447,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--weight-decay", type=float, default=DEFAULT_WEIGHT_DECAY)
     parser.add_argument("--layer", type=int, default=DEFAULT_LAYER)
     parser.add_argument("--raw-sum-mod-10", action="store_true", help="将 raw-sum probe 改为 10 分类（raw_sum mod 10）。")
-    parser.add_argument("--train-on-correct", action="store_true", help="按 Y:/vertical-flow/classifier.py 的口径，仅使用 correct-only 样本池切分 train/val 并训练 probe。")
+    parser.add_argument("--train-on-correct", action="store_true", help="仅使用 correct-only 样本池切分 train/val 并训练 probe。")
     parser.add_argument("--correct-train-ratio", type=float, default=DEFAULT_CORRECT_TRAIN_RATIO, help="开启 --train-on-correct 时，正确样本中分给 train 的比例，其余进入 val。")
     parser.add_argument(
         "--first-error",
@@ -1374,6 +1457,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
         help="是否仅保留目标位置为该样本首个错误的位置，默认 true。",
     )
+    parser.add_argument("--inertia-delta", type=float, default=0, help="沿用 dualstream_probe 的 phi 邻域门控窗口。")
     return parser
 
 
@@ -1382,6 +1466,8 @@ def main() -> None:
     args = parser.parse_args()
     if not (0.0 < args.correct_train_ratio < 1.0):
         raise ValueError("--correct-train-ratio 必须在 (0, 1) 区间内。")
+    if args.inertia_delta < 0:
+        raise ValueError("--inertia-delta 必须 >= 0。")
 
     set_global_seed(args.seed)
     device = maybe_get_device(args.device)
@@ -1738,6 +1824,16 @@ def main() -> None:
         train_target="raw_sum_classify",
         batch_size=args.batch_size,
     )
+    raw_val_metrics = evaluate_with_external_classifier(
+        classifier_module,
+        raw_model,
+        X_raw_fit_val,
+        y_raw_fit_val,
+        pos_raw_fit_val,
+        is_regression=False,
+        train_target="raw_sum_classify",
+        batch_size=args.batch_size,
+    )
     raw_test_metrics = evaluate_with_external_classifier(
         classifier_module,
         raw_model,
@@ -1801,6 +1897,16 @@ def main() -> None:
         train_target="C_potential",
         batch_size=args.batch_size,
     )
+    carry_val_metrics = evaluate_with_external_classifier(
+        classifier_module,
+        carry_model,
+        X_carry_fit_val,
+        y_carry_fit_val,
+        pos_carry_fit_val,
+        is_regression=True,
+        train_target="C_potential",
+        batch_size=args.batch_size,
+    )
     carry_test_metrics = evaluate_with_external_classifier(
         classifier_module,
         carry_model,
@@ -1828,30 +1934,15 @@ def main() -> None:
         test_preds=carry_test_preds,
     )
 
-    if len(X_raw_fit_val) > 0 and len(X_carry_fit_val) > 0:
-        raw_val_preds, _ = predict_with_external_classifier(
-            raw_model,
-            X_raw_fit_val,
-            batch_size=args.batch_size,
-            device=device,
-        )
-        carry_val_preds = predict_with_external_regressor(
-            carry_model,
-            X_carry_fit_val,
-            batch_size=args.batch_size,
-            device=device,
-        )
-        val_corrected_digits = (raw_val_preds % 10 + np.floor(np.maximum(carry_val_preds, 0.0)).astype(np.int64)) % 10
-    else:
-        val_corrected_digits = np.zeros(0, dtype=np.int64)
-    val_unexplained_stats = summarize_unexplained_probe_failures(val_data, val_corrected_digits)
-
+    raw_val_acc = safe_float(raw_val_metrics["acc"])
+    carry_val_floor_acc = safe_float(carry_val_metrics["floor_acc"])
     raw_test_mod10_acc = float(np.mean((raw_probe.test_preds % 10) == (test_data.raw_sum_full % 10)))
     error_rows, bucket_counts, corrected_test_digits = decompose_test_errors(
         test_data=test_data,
         raw_pred_labels=raw_probe.test_preds,
         carry_preds_phi=carry_probe.test_preds,
         raw_sum_mod_10=args.raw_sum_mod_10,
+        inertia_delta=args.inertia_delta,
     )
     error_type_stats = summarize_error_type_repairs(
         pred_digits=test_data.pred_digits,
@@ -1859,8 +1950,28 @@ def main() -> None:
         corrected_digits=corrected_test_digits,
         is_correct_mask=test_data.labels,
     )
+    error_type_bucket_stats = summarize_error_type_bucket_stats(error_rows)
 
     incorrect_test_count = int((~test_data.labels).sum())
+    decomposed_incorrect_count = int(sum(bucket_counts.get(bucket, 0) for bucket in BUCKET_ORDER))
+    if decomposed_incorrect_count != incorrect_test_count:
+        raise RuntimeError(
+            f"错误样本四分类数量不一致：bucket_sum={decomposed_incorrect_count}, incorrect_test_count={incorrect_test_count}"
+        )
+    off_by_one_bucket_count = int(
+        sum(error_type_bucket_stats["off_by_one_bucket_stats"][bucket]["count"] for bucket in BUCKET_ORDER)
+    )
+    other_error_bucket_count = int(
+        sum(error_type_bucket_stats["other_error_bucket_stats"][bucket]["count"] for bucket in BUCKET_ORDER)
+    )
+    if off_by_one_bucket_count != int(error_type_stats["off_by_one_count"]):
+        raise RuntimeError(
+            f"off_by_one bucket 统计不一致：bucket_sum={off_by_one_bucket_count}, off_by_one_count={error_type_stats['off_by_one_count']}"
+        )
+    if other_error_bucket_count != int(error_type_stats["other_error_count"]):
+        raise RuntimeError(
+            f"other_error bucket 统计不一致：bucket_sum={other_error_bucket_count}, other_error_count={error_type_stats['other_error_count']}"
+        )
     test_count = len(test_data)
     bucket_pct_of_test = {}
     bucket_pct_of_incorrect = {}
@@ -1895,6 +2006,7 @@ def main() -> None:
         "balance_target_classes": CURRENT_BALANCE_TARGET_CLASSES,
         "filter_by_result_len": True,
         "raw_sum_mod_10": bool(args.raw_sum_mod_10),
+        "inertia_delta": float(args.inertia_delta),
         "train_on_correct": bool(args.train_on_correct),
         "test_size": None if args.train_on_correct else DEFAULT_TEST_SIZE,
         "correct_train_ratio": float(args.correct_train_ratio),
@@ -1944,8 +2056,6 @@ def main() -> None:
             "raw_fit_val_rows": int(len(X_raw_fit_val)),
             "carry_fit_train_rows": int(len(X_carry_fit_train)),
             "carry_fit_val_rows": int(len(X_carry_fit_val)),
-            "val_unexplained_probe_failure_count": int(val_unexplained_stats["count"]),
-            "val_unexplained_probe_failure_ratio": float(val_unexplained_stats["ratio"]),
         },
         "raw_sum_probe": {
             "target": "raw_sum_classify",
@@ -1960,6 +2070,11 @@ def main() -> None:
                 "loss": safe_float(raw_probe.train_metrics["loss"]),
                 "acc": safe_float(raw_probe.train_metrics["acc"]),
                 "auc": safe_float(raw_probe.train_metrics["auc"]),
+            },
+            "val": {
+                "loss": safe_float(raw_val_metrics["loss"]),
+                "acc": raw_val_acc,
+                "auc": safe_float(raw_val_metrics["auc"]),
             },
             "test": {
                 "loss": safe_float(raw_probe.test_metrics["loss"]),
@@ -1980,6 +2095,11 @@ def main() -> None:
                 "mae": safe_float(carry_probe.train_metrics["mae"]),
                 "floor_acc": safe_float(carry_probe.train_metrics["floor_acc"]),
             },
+            "val": {
+                "loss": safe_float(carry_val_metrics["loss"]),
+                "mae": safe_float(carry_val_metrics["mae"]),
+                "floor_acc": carry_val_floor_acc,
+            },
             "test": {
                 "loss": safe_float(carry_probe.test_metrics["loss"]),
                 "mae": safe_float(carry_probe.test_metrics["mae"]),
@@ -1987,10 +2107,9 @@ def main() -> None:
             },
         },
         "error_decomposition": {
+            "inertia_delta": float(args.inertia_delta),
             "test_count": int(test_count),
             "incorrect_test_count": incorrect_test_count,
-            "val_unexplained_probe_failure_count": int(val_unexplained_stats["count"]),
-            "val_unexplained_probe_failure_ratio": float(val_unexplained_stats["ratio"]),
             "orig_error_count": int(error_type_stats["orig_error_count"]),
             "correct_test_count": int(bucket_counts.get("correct", 0)),
             "off_by_one_count": int(error_type_stats["off_by_one_count"]),
@@ -2001,6 +2120,8 @@ def main() -> None:
             "off_by_one_fix_rate": float(error_type_stats["off_by_one_fix_rate"]),
             "other_error_fix_count": int(error_type_stats["other_error_fix_count"]),
             "other_error_fix_rate": float(error_type_stats["other_error_fix_rate"]),
+            "off_by_one_bucket_stats": error_type_bucket_stats["off_by_one_bucket_stats"],
+            "other_error_bucket_stats": error_type_bucket_stats["other_error_bucket_stats"],
             "bucket_counts": {k: int(bucket_counts.get(k, 0)) for k in BUCKET_ORDER},
             "bucket_pct_of_test": bucket_pct_of_test,
             "bucket_pct_of_incorrect": bucket_pct_of_incorrect,
@@ -2017,20 +2138,23 @@ def main() -> None:
     print(f"Saved csv to:  {csv_path}")
     print(
         "Summary: "
+        f"inertia_delta={args.inertia_delta:.4f} | "
+        f"raw_val_acc={0.0 if raw_val_acc is None else raw_val_acc:.4f} | "
         f"raw_test_acc={raw_probe.test_metrics['acc']:.4f} | "
         f"raw_test_mod10_acc={raw_test_mod10_acc:.4f} | "
+        f"carry_val_floor_acc={0.0 if carry_val_floor_acc is None else carry_val_floor_acc:.4f} | "
         f"carry_test_floor_acc={carry_probe.test_metrics['floor_acc']:.4f} | "
-        f"val_unexplained_probe_failure={int(val_unexplained_stats['count'])} ({float(val_unexplained_stats['ratio']):.4f}) | "
-        f"carry_wrong_raw_correct={bucket_counts.get('carry_wrong_raw_correct', 0)} ({bucket_pct_of_test.get('carry_wrong_raw_correct', 0.0):.4f}) | "
+        f"both_correct={bucket_counts.get('both_correct', 0)} ({bucket_pct_of_test.get('both_correct', 0.0):.4f}) | "
+        f"raw_correct_carry_wrong={bucket_counts.get('raw_correct_carry_wrong', 0)} ({bucket_pct_of_test.get('raw_correct_carry_wrong', 0.0):.4f}) | "
         f"raw_wrong_carry_correct={bucket_counts.get('raw_wrong_carry_correct', 0)} ({bucket_pct_of_test.get('raw_wrong_carry_correct', 0.0):.4f}) | "
         f"both_wrong={bucket_counts.get('both_wrong', 0)} ({bucket_pct_of_test.get('both_wrong', 0.0):.4f}) | "
-        f"unexplained_probe_failure={bucket_counts.get('unexplained_probe_failure', 0)} ({bucket_pct_of_test.get('unexplained_probe_failure', 0.0):.4f}) | "
-        f"internal_anomaly={bucket_counts.get('internal_anomaly', 0)} ({bucket_pct_of_test.get('internal_anomaly', 0.0):.4f}) | "
         f"off_by_one={error_type_stats['off_by_one_count']} ({error_type_stats['off_by_one_ratio']:.4f}) | "
         f"off_by_one_fixed={error_type_stats['off_by_one_fix_count']} ({error_type_stats['off_by_one_fix_rate']:.4f}) | "
         f"other_error={error_type_stats['other_error_count']} ({error_type_stats['other_error_ratio']:.4f}) | "
         f"other_fixed={error_type_stats['other_error_fix_count']} ({error_type_stats['other_error_fix_rate']:.4f})"
     )
+    print(format_error_bucket_stats("Off-by-one bucket stats", error_type_bucket_stats["off_by_one_bucket_stats"]))
+    print(format_error_bucket_stats("Other-error bucket stats", error_type_bucket_stats["other_error_bucket_stats"]))
 
 
 if __name__ == "__main__":
