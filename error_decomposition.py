@@ -32,11 +32,13 @@ DEFAULT_BATCH_SIZE = 256
 DEFAULT_EPOCHS = 200
 DEFAULT_PATIENCE = 20
 DEFAULT_LR = 1e-4
+DEFAULT_MLP_DIRECT_LR = 1e-3
 DEFAULT_WEIGHT_DECAY = 1e-4
 DEFAULT_TEST_SIZE = 0.2
 DEFAULT_CORRECT_TRAIN_RATIO = 0.8
+DEFAULT_PROBE_MODE = "dual_probe"
 CURRENT_SAMPLE_FILTER_MODE = "all"
-CURRENT_BALANCE_MODE = "normal"
+CURRENT_BALANCE_MODE = "none"
 CURRENT_BALANCE_TARGET_CLASSES = False
 DEFAULT_MLP_HIDDEN_DIM = 512
 DEFAULT_MLP_DROPOUT = 0.2
@@ -1429,6 +1431,185 @@ def split_correct_training_subset(
     return correct_indices[inner_train_rel], correct_indices[inner_val_rel], strategy
 
 
+
+def validate_digit_labels(labels: np.ndarray, label_name: str) -> None:
+    arr = np.asarray(labels, dtype=np.int64)
+    if arr.size == 0:
+        raise RuntimeError(f"{label_name} 为空，无法训练/评估 mlp_direct。")
+    invalid_mask = (arr < 0) | (arr > 9)
+    if np.any(invalid_mask):
+        bad_values = np.unique(arr[invalid_mask]).tolist()
+        raise RuntimeError(f"{label_name} 存在非 0-9 标签: {bad_values[:10]}")
+
+
+def train_mlp_direct_classifier(
+    train_features: np.ndarray,
+    train_labels: np.ndarray,
+    val_features: np.ndarray,
+    val_labels: np.ndarray,
+    test_features: np.ndarray,
+    test_labels: np.ndarray,
+    batch_size: int,
+    epochs: int,
+    patience: int,
+    lr: float,
+    weight_decay: float,
+    device: torch.device,
+    split_strategy: str,
+) -> Tuple[ClassifierResult, Dict[str, Optional[float]]]:
+    validate_digit_labels(train_labels, "train_labels")
+    validate_digit_labels(val_labels, "val_labels")
+    validate_digit_labels(test_labels, "test_labels")
+
+    num_classes = 10
+    model = ProbeMLPClassifier(
+        train_features.shape[1],
+        num_classes,
+        hidden_dim=DEFAULT_MLP_HIDDEN_DIM,
+        dropout=DEFAULT_MLP_DROPOUT,
+    ).to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    train_loader = make_loader(train_features, train_labels.astype(np.int64), batch_size=batch_size, shuffle=True)
+
+    best_metric_name = "acc"
+    best_score = float("-inf")
+    best_epoch = 0
+    best_state = None
+    no_improve = 0
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        for batch_x, batch_y in train_loader:
+            batch_x = batch_x.to(device)
+            batch_y = batch_y.to(device)
+            optimizer.zero_grad()
+            logits = model(batch_x)
+            loss = criterion(logits, batch_y)
+            loss.backward()
+            optimizer.step()
+
+        val_metrics_epoch = evaluate_classifier(model, val_features, val_labels, batch_size, device, num_classes)
+        metric_score = float(val_metrics_epoch["acc"])
+        if metric_score > best_score:
+            best_score = metric_score
+            best_epoch = epoch
+            best_state = deepcopy(model.state_dict())
+            no_improve = 0
+        else:
+            no_improve += 1
+
+        if no_improve >= patience:
+            break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    train_metrics_raw = evaluate_classifier(model, train_features, train_labels, batch_size, device, num_classes)
+    val_metrics_raw = evaluate_classifier(model, val_features, val_labels, batch_size, device, num_classes)
+    test_metrics_raw = evaluate_classifier(model, test_features, test_labels, batch_size, device, num_classes)
+
+    train_metrics = {
+        "loss": float(train_metrics_raw["loss"]),
+        "acc": float(train_metrics_raw["acc"]),
+        "auc": None if train_metrics_raw["auc"] is None else float(train_metrics_raw["auc"]),
+    }
+    val_metrics = {
+        "loss": float(val_metrics_raw["loss"]),
+        "acc": float(val_metrics_raw["acc"]),
+        "auc": None if val_metrics_raw["auc"] is None else float(val_metrics_raw["auc"]),
+    }
+    test_metrics = {
+        "loss": float(test_metrics_raw["loss"]),
+        "acc": float(test_metrics_raw["acc"]),
+        "auc": None if test_metrics_raw["auc"] is None else float(test_metrics_raw["auc"]),
+    }
+
+    result = ClassifierResult(
+        model=model,
+        trained_epochs=best_epoch if best_epoch > 0 else epochs,
+        best_metric_name=best_metric_name,
+        best_test_metric=None if best_score == float("-inf") else float(best_score),
+        train_metrics=train_metrics,
+        test_metrics=test_metrics,
+        split_strategy=split_strategy,
+        num_classes=num_classes,
+        test_preds=np.asarray(test_metrics_raw["preds"], dtype=np.int64),
+        test_probs=np.asarray(test_metrics_raw["probs"], dtype=np.float32),
+    )
+    return result, val_metrics
+
+
+def compute_mlp_direct_correction_metrics(
+    corrected_digits: np.ndarray,
+    pred_orig_digits: np.ndarray,
+    gt_digits: np.ndarray,
+) -> Dict[str, float]:
+    corrected = np.asarray(corrected_digits, dtype=np.int64)
+    pred_orig = np.asarray(pred_orig_digits, dtype=np.int64)
+    gt = np.asarray(gt_digits, dtype=np.int64)
+    if corrected.shape[0] != pred_orig.shape[0] or corrected.shape[0] != gt.shape[0]:
+        raise RuntimeError("mlp_direct 评估长度不一致。")
+
+    n = corrected.shape[0]
+    if n == 0:
+        return {
+            "modified_rate": 0.0,
+            "tp_correction": 0.0,
+            "fp_preservation": 0.0,
+        }
+
+    modified_rate = float(np.sum(corrected != pred_orig) / n)
+    orig_errors = pred_orig != gt
+    tp_total = int(np.sum(orig_errors))
+    tp_correction = float(np.sum(orig_errors & (corrected == gt)) / tp_total) if tp_total > 0 else 0.0
+
+    orig_correct = pred_orig == gt
+    fp_total = int(np.sum(orig_correct))
+    fp_preservation = float(np.sum(orig_correct & (corrected == gt)) / fp_total) if fp_total > 0 else 0.0
+    return {
+        "modified_rate": modified_rate,
+        "tp_correction": tp_correction,
+        "fp_preservation": fp_preservation,
+    }
+
+
+def decompose_test_errors_mlp_direct(
+    test_data: PositionData,
+    mlp_pred_digits: np.ndarray,
+) -> List[Dict[str, object]]:
+    pred_arr = np.asarray(mlp_pred_digits, dtype=np.int64)
+    if pred_arr.shape[0] != len(test_data):
+        raise RuntimeError("mlp_direct 预测长度与 test_data 不一致。")
+
+    rows: List[Dict[str, object]] = []
+    for idx in range(len(test_data)):
+        is_correct = bool(test_data.labels[idx])
+        pred_digit = int(test_data.pred_digits[idx])
+        gt_digit = int(test_data.gt_digits[idx])
+        mlp_digit = int(pred_arr[idx])
+
+        off_by_one_direction = None if is_correct else get_off_by_one_direction(pred_digit, gt_digit)
+        error_type = "correct" if is_correct else ("off_by_one" if off_by_one_direction is not None else "other_error")
+        rows.append(
+            {
+                "sample_id": int(test_data.sample_ids[idx]),
+                "question": test_data.questions[idx],
+                "gt": test_data.gts[idx],
+                "gt_char_h5": test_data.gt_chars_h5[idx],
+                "gt_digit": gt_digit,
+                "pred_token": test_data.pred_tokens[idx],
+                "pred_digit": pred_digit,
+                "is_correct": int(is_correct),
+                "error_type": error_type,
+                "off_by_one_direction": off_by_one_direction,
+                "mlp_pred_digit": mlp_digit,
+                "mlp_changed_pred": int(mlp_digit != pred_digit),
+                "mlp_fixed_to_gt": int((not is_correct) and (mlp_digit == gt_digit)),
+            }
+        )
+    return rows
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Train raw-sum and carry probes from H5 samples, then decompose test errors into four buckets.",
@@ -1446,6 +1627,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr", type=float, default=DEFAULT_LR)
     parser.add_argument("--weight-decay", type=float, default=DEFAULT_WEIGHT_DECAY)
     parser.add_argument("--layer", type=int, default=DEFAULT_LAYER)
+    parser.add_argument("--probe-mode", type=str, choices=["dual_probe", "mlp_direct"], default=DEFAULT_PROBE_MODE, help="probe 模式：dual_probe=raw+carry 双探针，mlp_direct=MLP 直接预测 gt digit。")
     parser.add_argument("--raw-sum-mod-10", action="store_true", help="将 raw-sum probe 改为 10 分类（raw_sum mod 10）。")
     parser.add_argument("--train-on-correct", action="store_true", help="仅使用 correct-only 样本池切分 train/val 并训练 probe。")
     parser.add_argument("--correct-train-ratio", type=float, default=DEFAULT_CORRECT_TRAIN_RATIO, help="开启 --train-on-correct 时，正确样本中分给 train 的比例，其余进入 val。")
@@ -1457,7 +1639,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
         help="是否仅保留目标位置为该样本首个错误的位置，默认 true。",
     )
-    parser.add_argument("--inertia-delta", type=float, default=0, help="沿用 dualstream_probe 的 phi 邻域门控窗口。")
+    parser.add_argument("--inertia-delta", type=float, default=0.1, help="沿用 dualstream_probe 的 phi 邻域门控窗口。")
     return parser
 
 
@@ -1468,6 +1650,14 @@ def main() -> None:
         raise ValueError("--correct-train-ratio 必须在 (0, 1) 区间内。")
     if args.inertia_delta < 0:
         raise ValueError("--inertia-delta 必须 >= 0。")
+    cli_args = sys.argv[1:]
+    if args.probe_mode == "mlp_direct":
+        if "--raw-sum-mod-10" in cli_args:
+            raise ValueError("mlp_direct 模式不支持 --raw-sum-mod-10。")
+        if "--inertia-delta" in cli_args:
+            raise ValueError("mlp_direct 模式不支持 --inertia-delta。")
+        if "--lr" not in cli_args:
+            args.lr = DEFAULT_MLP_DIRECT_LR
 
     set_global_seed(args.seed)
     device = maybe_get_device(args.device)
@@ -1790,6 +1980,174 @@ def main() -> None:
         y_carry_fit_val = y_carry_test
         pos_carry_fit_val = pos_test
 
+    if args.probe_mode == "mlp_direct":
+        validate_digit_labels(train_data.gt_digits, "train_data.gt_digits")
+        validate_digit_labels(val_data.gt_digits, "val_data.gt_digits")
+        validate_digit_labels(test_data.gt_digits, "test_data.gt_digits")
+
+        mlp_probe, mlp_val_metrics = train_mlp_direct_classifier(
+            train_features=train_data.features,
+            train_labels=train_data.gt_digits,
+            val_features=val_data.features,
+            val_labels=val_data.gt_digits,
+            test_features=test_data.features,
+            test_labels=test_data.gt_digits,
+            batch_size=args.batch_size,
+            epochs=args.epochs,
+            patience=args.patience,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            device=device,
+            split_strategy=split_strategy,
+        )
+        corrected_test_digits = mlp_probe.test_preds
+        error_rows = decompose_test_errors_mlp_direct(test_data=test_data, mlp_pred_digits=corrected_test_digits)
+        error_type_stats = summarize_error_type_repairs(
+            pred_digits=test_data.pred_digits,
+            gt_digits=test_data.gt_digits,
+            corrected_digits=corrected_test_digits,
+            is_correct_mask=test_data.labels,
+        )
+        correction_metrics = compute_mlp_direct_correction_metrics(
+            corrected_digits=corrected_test_digits,
+            pred_orig_digits=test_data.pred_digits,
+            gt_digits=test_data.gt_digits,
+        )
+
+        test_count = len(test_data)
+        incorrect_test_count = int((~test_data.labels).sum())
+        if int(error_type_stats["orig_error_count"]) != int(error_type_stats["off_by_one_count"]) + int(error_type_stats["other_error_count"]):
+            raise RuntimeError("mlp_direct 错误统计不一致：orig_error_count != off_by_one_count + other_error_count")
+
+        summary = {
+            "task": "probe_error_decomposition",
+        "probe_mode": args.probe_mode,
+            "probe_mode": args.probe_mode,
+            "target_h5": str(args.h5),
+            "sample_reference_source": sample_reference_source,
+            "split_source": "generated_in_memory",
+            "target_pos": int(args.pos),
+            "layer": int(args.layer),
+            "input_pos": "consistent",
+            "feature_type": "flows",
+            "pooling_type": "none",
+            "sample_filter_mode": CURRENT_SAMPLE_FILTER_MODE,
+            "balance_mode": effective_balance_mode,
+            "balance_target_classes": CURRENT_BALANCE_TARGET_CLASSES,
+            "filter_by_result_len": True,
+            "raw_sum_mod_10": bool(args.raw_sum_mod_10),
+            "inertia_delta": float(args.inertia_delta),
+            "train_on_correct": bool(args.train_on_correct),
+            "test_size": None if args.train_on_correct else DEFAULT_TEST_SIZE,
+            "correct_train_ratio": float(args.correct_train_ratio),
+            "correct_val_ratio": float(1.0 - args.correct_train_ratio),
+            "seed": int(args.seed),
+            "device": str(device),
+            "load_stats": {
+                "rows_total": int(total_rows),
+                "rows_missing_sample_meta": 0,
+                "rows_pos_out_of_range": 0,
+                "rows_invalid_raw_sum": 0,
+            },
+            "alignment": {
+                "gt_char_mismatch_dropped": mismatch_count,
+                "target_result_len": int(target_result_len),
+                "result_len_dropped": int(dropped_by_result_len),
+                "pre_balance_rows": int(pre_balance_rows),
+                "pre_balance_correct": int(pre_balance_correct),
+                "pre_balance_wrong": int(pre_balance_wrong),
+                "balanced_rows": int(len(data)),
+                "balanced_unique_sample_ids": int(np.unique(data.sample_ids).size),
+            },
+            "splits": {
+                "all": summarize_split(data),
+                "train": summarize_split(train_data),
+                "val": summarize_split(val_data),
+                "test": summarize_split(test_data),
+            },
+            "probe_training": {
+                "train_on_correct": bool(args.train_on_correct),
+                "fit_sample_filter_mode": fit_sample_filter_mode,
+                "split_mode": "correct_train_val__wrong_test" if args.train_on_correct else "train_test",
+                "correct_train_ratio": float(args.correct_train_ratio) if args.train_on_correct else None,
+                "correct_val_ratio": float(1.0 - args.correct_train_ratio) if args.train_on_correct else None,
+                "train_rows": int(len(train_data)),
+                "val_rows": int(len(val_data)),
+                "test_rows": int(len(test_data)),
+                "outer_train_rows": int(len(train_data)),
+                "outer_train_correct_rows": int(train_data.labels.sum()),
+                "outer_train_wrong_rows": int((~train_data.labels).sum()),
+                "outer_test_rows": int(len(test_data)),
+                "mlp_early_stop_split_strategy": split_strategy,
+                "mlp_fit_train_rows": int(len(train_data)),
+                "mlp_fit_val_rows": int(len(val_data)),
+            },
+            "mlp_direct_probe": {
+                "target": "gt_digit_classify",
+                "num_classes": int(mlp_probe.num_classes),
+                "train_test_split_strategy": mlp_probe.split_strategy,
+                "early_stop_split_strategy": split_strategy,
+                "trained_epochs": int(mlp_probe.trained_epochs),
+                "best_metric_name": mlp_probe.best_metric_name,
+                "best_test_metric": safe_float(mlp_probe.best_test_metric),
+                "train": {
+                    "loss": safe_float(mlp_probe.train_metrics["loss"]),
+                    "acc": safe_float(mlp_probe.train_metrics["acc"]),
+                    "auc": safe_float(mlp_probe.train_metrics["auc"]),
+                },
+                "val": {
+                    "loss": safe_float(mlp_val_metrics["loss"]),
+                    "acc": safe_float(mlp_val_metrics["acc"]),
+                    "auc": safe_float(mlp_val_metrics["auc"]),
+                },
+                "test": {
+                    "loss": safe_float(mlp_probe.test_metrics["loss"]),
+                    "acc": safe_float(mlp_probe.test_metrics["acc"]),
+                    "auc": safe_float(mlp_probe.test_metrics["auc"]),
+                },
+            },
+            "mlp_error_repair": {
+                "test_count": int(test_count),
+                "incorrect_test_count": incorrect_test_count,
+                "orig_error_count": int(error_type_stats["orig_error_count"]),
+                "correct_test_count": int(np.sum(test_data.labels.astype(np.int64))),
+                "off_by_one_count": int(error_type_stats["off_by_one_count"]),
+                "other_error_count": int(error_type_stats["other_error_count"]),
+                "off_by_one_ratio": float(error_type_stats["off_by_one_ratio"]),
+                "other_error_ratio": float(error_type_stats["other_error_ratio"]),
+                "off_by_one_fix_count": int(error_type_stats["off_by_one_fix_count"]),
+                "off_by_one_fix_rate": float(error_type_stats["off_by_one_fix_rate"]),
+                "other_error_fix_count": int(error_type_stats["other_error_fix_count"]),
+                "other_error_fix_rate": float(error_type_stats["other_error_fix_rate"]),
+                "modified_rate": float(correction_metrics["modified_rate"]),
+                "tp_correction": float(correction_metrics["tp_correction"]),
+                "fp_preservation": float(correction_metrics["fp_preservation"]),
+            },
+        }
+
+        json_path = outdir / f"probe_error_decomposition_pos{args.pos}_mlp_direct.json"
+        csv_path = outdir / f"probe_error_decomposition_pos{args.pos}_mlp_direct.csv"
+        with json_path.open("w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
+        write_csv(error_rows, csv_path)
+
+        print(f"Saved json to: {json_path}")
+        print(f"Saved csv to:  {csv_path}")
+        print(
+            "Summary: "
+            f"probe_mode={args.probe_mode} | "
+            f"mlp_val_acc={0.0 if mlp_val_metrics['acc'] is None else mlp_val_metrics['acc']:.4f} | "
+            f"mlp_test_acc={mlp_probe.test_metrics['acc']:.4f} | "
+            f"off_by_one={error_type_stats['off_by_one_count']} ({error_type_stats['off_by_one_ratio']:.4f}) | "
+            f"off_by_one_fixed={error_type_stats['off_by_one_fix_count']} ({error_type_stats['off_by_one_fix_rate']:.4f}) | "
+            f"other_error={error_type_stats['other_error_count']} ({error_type_stats['other_error_ratio']:.4f}) | "
+            f"other_fixed={error_type_stats['other_error_fix_count']} ({error_type_stats['other_error_fix_rate']:.4f}) | "
+            f"modified_rate={correction_metrics['modified_rate']:.4f} | "
+            f"tp_correction={correction_metrics['tp_correction']:.4f} | "
+            f"fp_preservation={correction_metrics['fp_preservation']:.4f}"
+        )
+        return
+
     configure_vertical_flow_classifier(
         classifier_module=classifier_module,
         device=device,
@@ -1993,6 +2351,7 @@ def main() -> None:
 
     summary = {
         "task": "probe_error_decomposition",
+        "probe_mode": args.probe_mode,
         "target_h5": str(args.h5),
         "sample_reference_source": sample_reference_source,
         "split_source": "generated_in_memory",
