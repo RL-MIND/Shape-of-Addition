@@ -1362,7 +1362,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--h5", type=Path, default=DEFAULT_H5)
     parser.add_argument("--dataset", type=Path, default=Path("data/num3len10-10000.pkl"), help="Fallback dataset used only when the H5 file lacks sample metadata.")
     parser.add_argument("--pos", type=int, default=DEFAULT_POS)
-    parser.add_argument("--model", type=str, default="/data/Models/Qwen3-4b", help="Model path used to extract final-norm parameters.")
+    parser.add_argument("--model", type=str, default="Qwen/Qwen3-4B", help="Model path used to extract final-norm parameters.")
     parser.add_argument("--outdir", type=str, default=str(DEFAULT_OUTDIR))
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default=None)

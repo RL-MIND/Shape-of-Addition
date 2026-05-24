@@ -17,9 +17,16 @@ from pathlib import Path
 import pickle
 import matplotlib.pyplot as plt
 from matplotlib import animation
-import numba
-import umap
-from umap.aligned_umap import AlignedUMAP
+try:
+    import numba
+    import umap
+    from umap.aligned_umap import AlignedUMAP
+    UMAP_IMPORT_ERROR = None
+except ImportError as exc:
+    numba = None
+    umap = None
+    AlignedUMAP = None
+    UMAP_IMPORT_ERROR = exc
 from src.utils.flow_utils import load_and_process_data
 from src.utils.flow_utils import (
     load_token_meta_aligned,
@@ -51,7 +58,17 @@ os.environ['MKL_NUM_THREADS'] = str(UMAP_N_JOBS) if UMAP_N_JOBS > 0 else str(os.
 os.environ['OPENBLAS_NUM_THREADS'] = str(UMAP_N_JOBS) if UMAP_N_JOBS > 0 else str(os.cpu_count())
 os.environ['NUMEXPR_NUM_THREADS'] = str(UMAP_N_JOBS) if UMAP_N_JOBS > 0 else str(os.cpu_count())
 # Sync Numba thread count (affects UMAP embedding optimization)
-numba.set_num_threads(UMAP_N_JOBS if UMAP_N_JOBS > 0 else numba.get_num_threads())
+if numba is not None:
+    numba.set_num_threads(UMAP_N_JOBS if UMAP_N_JOBS > 0 else numba.get_num_threads())
+
+
+def require_umap_dependencies() -> None:
+    """Raise a clear error when UMAP/numba cannot be imported in the current environment."""
+    if UMAP_IMPORT_ERROR is not None:
+        raise ImportError(
+            "UMAP plotting requires compatible 'umap-learn' and 'numba' packages. "
+            f"The current environment failed to import them: {UMAP_IMPORT_ERROR}"
+        ) from UMAP_IMPORT_ERROR
 
 # UMAP evolution continuity control
 # 'independent': run each layer independently (default)
@@ -72,7 +89,7 @@ SKIP_LAYER_0 = True   # True, False: skip layer 0 (when computing all layers; in
 # MODEL_PATH = "/home/wenliuyuan/vertical-flow/quanta_maths/models/mix_d13_l3_h4_t85K_s572091"
 
 MODEL_BACKEND = "hf"
-MODEL_PATH = "/data/wenliuyuan/models/Qwen3-4B-Instruct-2507"
+MODEL_PATH = "Qwen/Qwen3-4B"
 
 # MODEL_PATH = "path/to/your/model"
 
@@ -228,6 +245,7 @@ def get_model_embeddings(model):
 
 def validate_parameters():
     """Validate parameter configuration compatibility."""
+    require_umap_dependencies()
     if MODEL_BACKEND not in {"hf", "quanta"}:
         raise ValueError(
             f"Invalid MODEL_BACKEND: {MODEL_BACKEND}. "
@@ -742,7 +760,9 @@ def compute_prefix_is_correct_labels(data_path, position, sample_indices):
         return np.ones(len(sample_indices), dtype=np.int64)
 
     prefix_positions = list(range(current_pos))
-    prefix_results = load_all_token_results(data_path, prefix_positions, verbose=False)
+    prefix_results = load_all_token_results(
+        data_path, prefix_positions, feature_type=FEATURE_TYPE, verbose=False
+    )
 
     prefix_maps = {}
     for p in prefix_positions:
@@ -874,7 +894,9 @@ def compute_marker_mode_values(data_path, position, sample_indices, pred_digits)
         
         # Load next-position data
         try:
-            all_token_results = load_all_token_results(data_path, next_pos, verbose=False)
+            all_token_results = load_all_token_results(
+                data_path, next_pos, feature_type=FEATURE_TYPE, verbose=False
+            )
             if next_pos not in all_token_results:
                 print(f"  Warning: next position {next_pos} data not found")
                 return result
@@ -906,7 +928,9 @@ def compute_marker_mode_values(data_path, position, sample_indices, pred_digits)
         
         # Load next-position data
         try:
-            all_token_results = load_all_token_results(data_path, next_pos, verbose=False)
+            all_token_results = load_all_token_results(
+                data_path, next_pos, feature_type=FEATURE_TYPE, verbose=False
+            )
             if next_pos not in all_token_results:
                 print(f"  Warning: next position {next_pos} data not found")
                 return result
@@ -2781,7 +2805,8 @@ def apply_cli_args(args):
     os.environ['OPENBLAS_NUM_THREADS'] = os.environ['OMP_NUM_THREADS']
     os.environ['NUMEXPR_NUM_THREADS'] = os.environ['OMP_NUM_THREADS']
     try:
-        numba.set_num_threads(UMAP_N_JOBS if UMAP_N_JOBS > 0 else numba.get_num_threads())
+        if numba is not None:
+            numba.set_num_threads(UMAP_N_JOBS if UMAP_N_JOBS > 0 else numba.get_num_threads())
     except Exception as exc:
         print(f"Warning: failed to set numba thread count: {exc}")
     return args
@@ -2796,7 +2821,9 @@ def main():
     if COMPUTE_ALL_COMBINATIONS:
         validate_batch_mode_capabilities()
         print("====== Auto-discover all positions and run ======")
-        temp_pos_meta, _, _, _, _, _ = load_token_meta_aligned(DATA_PATH, 'all', verbose=False)
+        temp_pos_meta, _, _, _, _, _ = load_token_meta_aligned(
+            DATA_PATH, 'all', feature_type=FEATURE_TYPE, verbose=False
+        )
         all_positions = temp_pos_meta
         # Filter out 'extra' positions
         all_positions = [pos for pos in all_positions if pos != 'extra']

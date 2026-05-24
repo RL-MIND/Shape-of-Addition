@@ -282,7 +282,7 @@ def main(argv=None) -> None:
         default="replacement",
         help="Correction method to run.",
     )
-    parser.add_argument("--model", type=str, default="/data/Models/Qwen3-4b")
+    parser.add_argument("--model", type=str, default="Qwen/Qwen3-4B")
     parser.add_argument("--max-new-tokens", type=int, default=25)
     parser.add_argument("--max-samples", type=int, default=10000)
     parser.add_argument("--test-mode", type=str, choices=["online", "offline"], default="online")

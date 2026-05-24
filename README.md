@@ -34,7 +34,7 @@ pip install -r requirements.txt
 
 ```bash
 python src/generation.py \
-  --model-path /data/wenliuyuan/models/Qwen3-4B-Instruct-2507 \
+  --model-path Qwen/Qwen3-4B \
   --dataset data/num3len10-100000.pkl \
   --output-h5 results/activations/plus_num3len10_Qwen3-4B_nocheckall_balance_both.h5
 ```
@@ -46,7 +46,7 @@ python src/experiment.py \
   --method dual-stream \
   --h5 results/activations/plus_num3len10_Qwen3-4b/plus_num3len10_Qwen3-4b.h5 \
   --dataset data/num3len10-10000.pkl \
-  --model /data/Models/Qwen3-4b
+  --model Qwen/Qwen3-4B
 ```
 
 Supported correction methods are `replacement`, `steering`, `dual-stream`, `prompt`, and `all`.

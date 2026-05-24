@@ -536,7 +536,7 @@ def main(argv=None) -> None:
     parser.add_argument("--layer-end", type=int, default=None)
     parser.add_argument("--test-mode", type=str, choices=["online", "offline"], default="online")
     parser.add_argument("--mode", type=str, choices=["direct", "prompt"], default="direct")
-    parser.add_argument("--model", type=str, default=None)
+    parser.add_argument("--model", type=str, default="Qwen/Qwen3-4B")
     parser.add_argument("--max-new-tokens", type=int, default=25)
     parser.add_argument("--max-samples", type=int, default=10000)
     parser.add_argument("--output", type=Path, default=None)

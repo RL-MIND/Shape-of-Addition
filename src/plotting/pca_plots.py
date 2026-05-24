@@ -26,7 +26,7 @@ DATA_PATH = "results/activations/plus_num3len10_Qwen3-4B_nocheckall_balance_both
 
 BALANCE_MODE = 'none'  # 'none', 'normal', 'strong'
 POSITION_SELECT = 4    # Position select: 'all'/'all_no_extra'/'extra' or int/list
-FEATURE_TYPE = "flows"  # 'flows' | 'velocities' | 'curvatures'
+FEATURE_TYPE = "post_ffn"  # 'post_attn' | 'post_ffn' | 'flows' | 'velocities' | 'curvatures'
 POOLING = 'none'       # 'none' | 'avg' | 'max'
 
 # PCA parameters
@@ -235,7 +235,7 @@ def main():
 
     # Load token meta
     _, _, _, preds_list, gt_chars_list, input_tokens_list = load_token_meta_aligned(
-        data_path, position_select, verbose=False
+        data_path, position_select, feature_type=feature_type, verbose=False
     )
 
     pred_digits = np.asarray([int(p) if str(p).isdigit() else -1 for p in preds_list], dtype=np.int64)
@@ -245,7 +245,9 @@ def main():
     ], dtype=np.int64)
 
     # Carry information
-    all_token_results = load_all_token_results(data_path, position_select, verbose=False)
+    all_token_results = load_all_token_results(
+        data_path, position_select, feature_type=feature_type, verbose=False
+    )
     _, _, _, _, _, _, sample_idx_list, incoming_carries_list, outgoing_carries_list = select_positions_extended(
         all_token_results, position_select, verbose=False
     )

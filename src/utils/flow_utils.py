@@ -456,7 +456,10 @@ def select_positions_extended(
 
 
 def load_token_meta_aligned(
-    file_path: Union[str, Path], position_select: Union[str, int, List[int]], verbose: bool = True
+    file_path: Union[str, Path],
+    position_select: Union[str, int, List[int]],
+    feature_type: str = "flows",
+    verbose: bool = True,
 ) -> Tuple[List[Any], np.ndarray, np.ndarray, List[str], List[str], List[str]]:
     """
     Load meta aligned with flattened sample order (labels/preds/gt_chars/position_idx/input_tokens).
@@ -468,7 +471,9 @@ def load_token_meta_aligned(
                   For pos=0, set to 'pl'.
     """
     # 1. Preload to determine selected positions (verbosity controlled externally)
-    all_token_results = load_all_token_results(file_path, position_select, verbose=verbose)
+    all_token_results = load_all_token_results(
+        file_path, position_select, feature_type=feature_type, verbose=verbose
+    )
     selected_positions, labels_list, position_idx_list, _flows_list, preds_list, gt_chars_list, sample_idx_list, _, _ = (
         select_positions_extended(all_token_results, position_select, verbose=verbose)
     )
@@ -484,7 +489,9 @@ def load_token_meta_aligned(
     # Reload if prerequisite positions are missing (second load is usually quiet)
     if needed_prev_positions:
         combined_select = list(set(selected_positions) | set(needed_prev_positions))
-        all_token_results = load_all_token_results(file_path, combined_select, verbose=False)
+        all_token_results = load_all_token_results(
+            file_path, combined_select, feature_type=feature_type, verbose=False
+        )
 
     # 3. Build (pos, sample_idx) -> pred mapping
     pred_map = {} # pos -> {sample_idx: pred}

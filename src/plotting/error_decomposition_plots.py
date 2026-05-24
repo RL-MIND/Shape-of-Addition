@@ -13,10 +13,10 @@ import numpy as np
 import pandas as pd
 
 
-REPO_ROOT = Path(__file__).resolve().parent
-DEFAULT_CSV = REPO_ROOT / "results" / "error_decomposition" / "probe_error_decomposition_pos4.csv"
-DEFAULT_JSON = REPO_ROOT / "results" / "error_decomposition" / "probe_error_decomposition_pos4.json"
-DEFAULT_OUTPUT = REPO_ROOT / "results" / "error_decomposition" / "probe_error_decomposition_pos4_trajectory_umap.pdf"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_CSV = REPO_ROOT / "results" / "tables" / "error_decomposition" / "probe_error_decomposition_pos4.csv"
+DEFAULT_JSON = REPO_ROOT / "results" / "tables" / "error_decomposition" / "probe_error_decomposition_pos4.json"
+DEFAULT_OUTPUT = REPO_ROOT / "results" / "plots" / "error_decomposition" / "probe_error_decomposition_pos4_trajectory_umap.pdf"
 DEFAULT_N_COMPONENTS = 2
 DEFAULT_N_NEIGHBORS = 300
 DEFAULT_MIN_DIST = 0.3
@@ -31,6 +31,7 @@ DEFAULT_CORRECT_SAMPLE_DIVISOR = 4
 DEFAULT_MAX_POINTS_PER_GROUP = 200
 
 UMAP_SCRIPT_CANDIDATES = [
+    REPO_ROOT / "src" / "plotting" / "umap_plots.py",
     Path(r"Y:\vertical-flow\umap_plot_script.py"),
     Path("/home/wenliuyuan/vertical-flow/umap_plot_script.py"),
 ]
@@ -82,7 +83,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--json", type=Path, default=DEFAULT_JSON, help="Path to the error decomposition JSON summary.")
     parser.add_argument("--h5", type=Path, default=None, help="Optional H5 path override. Defaults to target_h5 in the JSON.")
     parser.add_argument("--dataset", type=Path, default=None, help="Optional dataset pickle fallback when H5 lacks usable samples metadata.")
-    parser.add_argument("--model", type=str, default=None, help="Model path for extracting digit anchors. Defaults to umap_plot_script.py MODEL_PATH.")
+    parser.add_argument("--model", type=str, default="Qwen/Qwen3-4B", help="Model path for extracting digit anchors.")
     parser.add_argument("--out", type=Path, default=DEFAULT_OUTPUT, help="Output PDF path.")
     parser.add_argument("--layer", type=int, default=None, help="Layer index for extracting flow vectors. Defaults to JSON layer.")
     parser.add_argument("--n-neighbors", type=int, default=DEFAULT_N_NEIGHBORS, help="UMAP n_neighbors.")

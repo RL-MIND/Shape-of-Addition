@@ -300,7 +300,7 @@ def main(argv=None) -> None:
     parser.add_argument("--mode", type=str, choices=["direct", "steer"], default="direct")
     parser.add_argument("--lambda-grid", type=str, default="0.0,0.25,0.5,0.75,1.0")
     parser.add_argument("--test-mode", type=str, choices=["online", "offline"], default="online")
-    parser.add_argument("--model", type=str, default=None)
+    parser.add_argument("--model", type=str, default="Qwen/Qwen3-4B")
     parser.add_argument("--max-new-tokens", type=int, default=25)
     parser.add_argument("--max-samples", type=int, default=10000)
     parser.add_argument("--output", type=Path, default=None)

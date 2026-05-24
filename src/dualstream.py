@@ -1527,7 +1527,7 @@ def main(argv=None):
     parser.add_argument("--vector-steer", action="store_true", help="Use vector steering instead of raw_sum+incarry correction")
     parser.add_argument("--output", type=Path, default=None, help="Optional path to write metrics JSON")
     parser.add_argument("--test-mode", type=str, choices=["online", "offline"], default="online")
-    parser.add_argument("--model", type=str, default="/data/Models/Qwen3-4b")
+    parser.add_argument("--model", type=str, default="Qwen/Qwen3-4B")
     parser.add_argument("--max-new-tokens", type=int, default=25)
     parser.add_argument(
         "--max-samples",

@@ -108,7 +108,7 @@ PLOT_SAMPLE_LABELS = [
 SPECIFIC_LAYER_INDEX = 36  # None, 0, 1, 2, ...
 
 # --- Model path and norm settings ---
-MODEL_PATH = "/data/wenliuyuan/models/Qwen3-4B-Instruct-2507"
+MODEL_PATH = "Qwen/Qwen3-4B"
 APPLY_MODEL_NORM = True  # True/False: load model and apply final norm to hidden states
 
 # --- Sample filter mode ---

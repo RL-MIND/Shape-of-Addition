@@ -29,7 +29,7 @@ DEVICE = 'auto'
 # Model path
 
 # MODEL_PATH = "path/to/your/model"
-MODEL_PATH = "/data/wenliuyuan/models/Qwen3-4B-Instruct-2507"
+MODEL_PATH = "Qwen/Qwen3-4B"
 
 # Dataset path
 DATA_PATH = 'data/num3len10-100000.pkl'
