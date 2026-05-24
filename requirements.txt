@@ -1,0 +1,10 @@
+torch
+transformers
+accelerate
+numpy<2.3
+h5py
+scikit-learn
+matplotlib
+tqdm
+umap-learn
+pandas

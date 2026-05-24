@@ -1,27 +1,18 @@
 import argparse
-from datetime import datetime
 import json
 import math
-import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from probe_data import load_h5_baseline_metrics
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
+from src.utils.metrics import compute_mean_std_ci  # noqa: E402
+from src.utils.probe_data import load_h5_baseline_metrics  # noqa: E402
 
-T_CRITICAL_95 = {
-    1: 12.706,
-    2: 4.303,
-    3: 3.182,
-    4: 2.776,
-    5: 2.571,
-    6: 2.447,
-    7: 2.365,
-    8: 2.306,
-    9: 2.262,
-    10: 2.228,
-}
 
 COMMON_AGGREGATE_METRIC_KEYS = [
     "orig_eval_token_acc",
@@ -37,7 +28,7 @@ COMMON_AGGREGATE_METRIC_KEYS = [
     "fp_preservation",
 ]
 
-MLP_PROMPT_AGGREGATE_METRIC_KEYS = [
+REPLACEMENT_PROMPT_AGGREGATE_METRIC_KEYS = [
     "val_acc",
     "off_by_one_count",
     "other_error_count",
@@ -45,7 +36,7 @@ MLP_PROMPT_AGGREGATE_METRIC_KEYS = [
     "other_error_ratio",
 ]
 
-STEER_AGGREGATE_METRIC_KEYS = [
+STEERING_AGGREGATE_METRIC_KEYS = [
     "val_acc",
     "val_token_acc",
     "val_sample_acc",
@@ -59,75 +50,26 @@ def compute_spi(corrected: float, orig: float) -> float:
     return (corrected - orig) / max(1.0 - orig, eps)
 
 
-def run_script(cmd: list[str]) -> None:
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"Command failed: {' '.join(cmd)}\n{result.stderr}")
-    if result.stdout:
-        print(result.stdout, end="")
-
-
 def load_json(path: Path) -> Dict[str, object]:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
-def compute_mean_std_ci(values: List[float]) -> Dict[str, Optional[float]]:
-    clean_values: List[float] = []
-    for value in values:
-        try:
-            numeric = float(value)
-        except (TypeError, ValueError):
-            continue
-        if math.isnan(numeric) or math.isinf(numeric):
-            continue
-        clean_values.append(numeric)
-
-    if not clean_values:
-        return {"count": 0, "mean": None, "std": None, "ci95_low": None, "ci95_high": None}
-
-    mean = float(sum(clean_values) / len(clean_values))
-    if len(clean_values) == 1:
-        return {"count": 1, "mean": mean, "std": 0.0, "ci95_low": mean, "ci95_high": mean}
-
-    variance = sum((value - mean) ** 2 for value in clean_values) / (len(clean_values) - 1)
-    std = math.sqrt(variance)
-    df = len(clean_values) - 1
-    t_critical = T_CRITICAL_95.get(df, 1.96)
-    margin = float(t_critical * std / math.sqrt(len(clean_values)))
-    return {
-        "count": len(clean_values),
-        "mean": mean,
-        "std": std,
-        "ci95_low": mean - margin,
-        "ci95_high": mean + margin,
-    }
-
-
-def normalize_method(method: str) -> str:
-    return "force" if method == "dual" else method
-
-
 def resolve_methods(method: str, test_mode: str) -> List[str]:
-    requested = normalize_method(method)
-    if requested == "all":
-        methods = ["mlp", "steer", "force", "prompt"]
-        if test_mode == "teacher":
-            skipped = ["prompt"]
-            print(f"Skipping unsupported teacher methods: {', '.join(skipped)}")
-            return ["mlp", "steer", "force"]
+    if method == "all":
+        methods = ["replacement", "steering", "dual-stream"]
+        if test_mode == "online":
+            methods.append("prompt")
         return methods
 
-    if test_mode == "teacher" and requested == "prompt":
-        raise ValueError("teacher mode is not supported for method=prompt")
-    return [requested]
+    return [method]
 
 
 def resolve_aggregate_metric_keys(method: str) -> List[str]:
-    if method in {"mlp", "prompt"}:
-        return [*COMMON_AGGREGATE_METRIC_KEYS, *MLP_PROMPT_AGGREGATE_METRIC_KEYS]
-    if method == "steer":
-        return [*COMMON_AGGREGATE_METRIC_KEYS, *STEER_AGGREGATE_METRIC_KEYS]
+    if method in {"replacement", "prompt"}:
+        return [*COMMON_AGGREGATE_METRIC_KEYS, *REPLACEMENT_PROMPT_AGGREGATE_METRIC_KEYS]
+    if method == "steering":
+        return [*COMMON_AGGREGATE_METRIC_KEYS, *STEERING_AGGREGATE_METRIC_KEYS]
     return COMMON_AGGREGATE_METRIC_KEYS
 
 
@@ -188,15 +130,33 @@ def append_common_args(
     return cmd
 
 
+def append_dual_stream_args(
+    cmd: list[str],
+    args: argparse.Namespace,
+    out_path: Path,
+    seed: Optional[int] = None,
+) -> list[str]:
+    cmd = append_common_args(cmd, args, out_path, seed=seed)
+    if args.layers and len(args.layers) == 1:
+        layer_arg = str(args.layers[0])
+        try:
+            idx = cmd.index("--layers")
+        except ValueError:
+            return cmd
+        cmd[idx:idx + 2] = ["--layers", layer_arg, layer_arg]
+    cmd += ["--inertia-delta", str(args.inertia_delta)]
+    return cmd
+
+
 def resolve_output_path(method: str, out_dir: Path, timestamp: str) -> Path:
-    if method == "mlp":
-        return out_dir / f"mlp_probe_{timestamp}.json"
-    if method == "steer":
-        return out_dir / f"linear_probe_steer_{timestamp}.json"
-    if method == "force":
-        return out_dir / f"dualstream_probe_{timestamp}.json"
+    if method == "replacement":
+        return out_dir / f"replacement_{timestamp}.json"
+    if method == "steering":
+        return out_dir / f"steering_{timestamp}.json"
+    if method == "dual-stream":
+        return out_dir / f"dual_stream_{timestamp}.json"
     if method == "prompt":
-        return out_dir / f"mlp_probe_prompt_{timestamp}.json"
+        return out_dir / f"prompt_{timestamp}.json"
     raise ValueError(f"Unsupported method: {method}")
 
 
@@ -204,25 +164,44 @@ def resolve_seed_output_path(out_path: Path, seed: int) -> Path:
     return out_path.with_name(f"{out_path.stem}_seed{seed}{out_path.suffix}")
 
 
-def build_method_command(
+def build_method_argv(
     method: str,
     args: argparse.Namespace,
     out_path: Path,
     seed: Optional[int] = None,
 ) -> list[str]:
-    if method == "mlp":
-        return append_common_args([sys.executable, str(args.mlp_script)], args, out_path, seed=seed)
-    if method == "steer":
+    if method == "replacement":
+        return append_common_args([], args, out_path, seed=seed)
+    if method == "steering":
         return append_common_args(
-            [sys.executable, str(args.linear_script), "--mode", "steer", "--lambda-grid", args.lambda_grid],
+            ["--mode", "steer", "--lambda-grid", args.lambda_grid],
             args,
             out_path,
             seed=seed,
         )
-    if method == "force":
-        return append_common_args([sys.executable, str(args.force_script)], args, out_path, seed=seed)
+    if method == "dual-stream":
+        return append_dual_stream_args([], args, out_path, seed=seed)
     if method == "prompt":
-        return append_common_args([sys.executable, str(args.mlp_script), "--mode", "prompt"], args, out_path, seed=seed)
+        return append_common_args(["--mode", "prompt"], args, out_path, seed=seed)
+    raise ValueError(f"Unsupported method: {method}")
+
+
+def run_method(method: str, argv: list[str]) -> None:
+    if method in {"replacement", "prompt"}:
+        from src import mlp_probe
+
+        mlp_probe.main(argv)
+        return
+    if method == "steering":
+        from src import linear_probe
+
+        linear_probe.main(argv)
+        return
+    if method == "dual-stream":
+        from src import dualstream
+
+        dualstream.main(argv)
+        return
     raise ValueError(f"Unsupported method: {method}")
 
 
@@ -282,41 +261,49 @@ def print_metrics(metrics: Dict[str, object], skip_orig: bool) -> None:
     print(f"sample_spi: {format_metric(sample_spi)}")
 
 
-def main() -> None:
+def main(argv=None) -> None:
     parser = argparse.ArgumentParser(description="Unified experiment runner.")
-    parser.add_argument("--h5", type=Path, default=Path("results/plus_num3len10_Qwen3-4b/plus_num3len10_Qwen3-4b.h5"))
-    parser.add_argument("--dataset", type=Path, default=Path("num3len10-10000.pkl"))
+    parser.add_argument(
+        "--h5",
+        type=Path,
+        default=Path("results/activations/plus_num3len10_Qwen3-4b/plus_num3len10_Qwen3-4b.h5"),
+    )
+    parser.add_argument("--dataset", type=Path, default=Path("data/num3len10-10000.pkl"))
     parser.add_argument("--positions", type=int, nargs="*", default=None)
     parser.add_argument("--train-ratio", type=float, default=0.8)
     parser.add_argument("--val-ratio", type=float, default=0.1)
     parser.add_argument("--test-ratio", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-seeds", type=int, default=5)
-    parser.add_argument("--method", type=str, choices=["mlp", "steer", "force", "dual", "prompt", "all"], default="mlp")
+    parser.add_argument(
+        "--method",
+        type=str,
+        choices=["replacement", "steering", "dual-stream", "prompt", "all"],
+        default="replacement",
+        help="Correction method to run.",
+    )
     parser.add_argument("--model", type=str, default="/data/Models/Qwen3-4b")
     parser.add_argument("--max-new-tokens", type=int, default=25)
     parser.add_argument("--max-samples", type=int, default=10000)
-    parser.add_argument("--test-mode", type=str, choices=["online", "offline", "teacher"], default="online")
+    parser.add_argument("--test-mode", type=str, choices=["online", "offline"], default="online")
     parser.add_argument("--layer-start", type=int, default=None)
     parser.add_argument("--layer-end", type=int, default=None)
     parser.add_argument("--layers", type=int, nargs="*", default=None)
     parser.add_argument("--lambda-grid", type=str, default="0.0,0.25,0.5,0.75,1.0")
-    parser.add_argument("--out-dir", type=Path, default=Path("log/log_experiments"))
-    parser.add_argument("--force-script", "--dual-script", dest="force_script", type=Path, default=Path("dualstream_probe.py"))
-    parser.add_argument("--linear-script", type=Path, default=Path("linear_probe.py"))
-    parser.add_argument("--mlp-script", type=Path, default=Path("mlp_probe.py"))
+    parser.add_argument("--inertia-delta", type=float, default=0.0, help="Dual-stream carry tolerance window.")
+    parser.add_argument("--out-dir", type=Path, default=Path("results/logs/log_experiments"))
     parser.add_argument("--skip-orig", action="store_true", help="Skip baseline/improvement/SPI output")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.num_seeds <= 0:
         raise ValueError("--num-seeds must be a positive integer")
 
     methods = resolve_methods(args.method, args.test_mode)
-    invalid_multi_seed_methods = [method for method in methods if method != "force"]
-    if args.num_seeds > 1 and args.test_mode != "online" and invalid_multi_seed_methods:
+    offline_multi_seed_methods = [method for method in methods if method != "dual-stream"]
+    if args.num_seeds > 1 and args.test_mode != "online" and offline_multi_seed_methods:
         raise ValueError(
-            "Multi-seed for non-force methods only supports --test-mode online; "
-            f"got {args.test_mode} for methods: {', '.join(invalid_multi_seed_methods)}"
+            "Multi-seed for non-dual-stream methods only supports --test-mode online; "
+            f"got {args.test_mode} for methods: {', '.join(offline_multi_seed_methods)}"
         )
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -342,15 +329,15 @@ def main() -> None:
         print(f"Method: {method}")
 
         out_path = resolve_output_path(method, args.out_dir, timestamp)
-        if method == "force":
-            cmd = build_method_command(method, args, out_path, seed=args.seed)
+        if method == "dual-stream":
+            method_argv = build_method_argv(method, args, out_path, seed=args.seed)
             if args.num_seeds > 1:
-                cmd += ["--num-seeds", str(args.num_seeds)]
-            run_script(cmd)
+                method_argv += ["--num-seeds", str(args.num_seeds)]
+            run_method(method, method_argv)
             corrected_metrics = load_json(out_path)
         elif args.num_seeds == 1:
-            cmd = build_method_command(method, args, out_path, seed=args.seed)
-            run_script(cmd)
+            method_argv = build_method_argv(method, args, out_path, seed=args.seed)
+            run_method(method, method_argv)
             corrected_metrics = load_json(out_path)
         else:
             seed_runs: List[Dict[str, object]] = []
@@ -358,8 +345,8 @@ def main() -> None:
                 current_seed = args.seed + seed_offset
                 print(f"Running seed {current_seed}...")
                 seed_out_path = resolve_seed_output_path(out_path, current_seed)
-                cmd = build_method_command(method, args, seed_out_path, seed=current_seed)
-                run_script(cmd)
+                method_argv = build_method_argv(method, args, seed_out_path, seed=current_seed)
+                run_method(method, method_argv)
                 seed_metrics = load_json(seed_out_path)
                 seed_metrics["seed"] = int(current_seed)
                 seed_runs.append(seed_metrics)

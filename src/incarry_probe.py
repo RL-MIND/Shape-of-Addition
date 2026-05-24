@@ -12,6 +12,8 @@ import torch.optim as optim
 from sklearn.metrics import accuracy_score, roc_auc_score
 from sklearn.model_selection import train_test_split
 
+from src.models import CircularProbe, ProbeMLP
+
 try:
     import h5py
 except ImportError as exc:  # pragma: no cover
@@ -19,7 +21,7 @@ except ImportError as exc:  # pragma: no cover
 
 # Default configuration
 DEFAULT_DATA_PATH = Path(
-    "results/plus_num3len10_Qwen3-4b/plus_num3len10_Qwen3-4b.h5"
+    "results/activations/plus_num3len10_Qwen3-4b/plus_num3len10_Qwen3-4b.h5"
 )
 DEFAULT_PROBE_TYPE = "mlp"  # choices: linear, mlp, circular
 DEFAULT_BATCH_SIZE = 256
@@ -30,61 +32,15 @@ DEFAULT_MAX_EPOCHS = 200
 DEFAULT_TEST_SIZE = 0.1
 DEFAULT_SEED = 42
 
-LOG_DIR = Path("log/log_incarry")
-SAVE_DIR = Path("saved_models")
+LOG_DIR = Path("results/logs/log_incarry")
+SAVE_DIR = Path("results/checkpoints")
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 # ----------------------------
-# Model definitions
+# Model factory
 # ----------------------------
-
-class ProbeMLP(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int = 512, dropout: float = 0.3, num_classes: int = 10):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim // 4),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 4, num_classes),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
-
-
-class CircularProbe(nn.Module):
-    """Project hidden states to an angle on a circle and classify digits."""
-
-    def __init__(self, input_dim: int, num_classes: int = 10):
-        super().__init__()
-        self.num_classes = num_classes
-        self.w1 = nn.Linear(input_dim, 1, bias=False)
-        self.w2 = nn.Linear(input_dim, 1, bias=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        proj1 = self.w1(x).squeeze(-1)
-        proj2 = self.w2(x).squeeze(-1)
-        theta = torch.atan2(proj1, proj2)
-        theta = torch.where(theta < 0, theta + 2 * math.pi, theta)
-        angles_per_class = 2 * math.pi / self.num_classes
-        class_angles = torch.arange(self.num_classes, device=x.device, dtype=x.dtype) * angles_per_class
-        theta_expanded = theta.unsqueeze(1)
-        class_angles_expanded = class_angles.unsqueeze(0)
-        logits = torch.cos(theta_expanded - class_angles_expanded) * 10.0
-        return logits
-
-    def predict_class(self, x: torch.Tensor) -> torch.Tensor:
-        proj1 = self.w1(x).squeeze(-1)
-        proj2 = self.w2(x).squeeze(-1)
-        theta = torch.atan2(proj1, proj2)
-        theta = torch.where(theta < 0, theta + 2 * math.pi, theta)
-        preds = theta * (self.num_classes / (2 * math.pi))
-        return preds.round().long() % self.num_classes
 
 
 def build_model(probe_type: str, input_dim: int, num_classes: int) -> nn.Module:
@@ -147,11 +103,18 @@ def load_carry_data(path: Path, include_extra: bool = False) -> Tuple[np.ndarray
             if pos_name not in positions_group:
                 continue
             pos_group = positions_group[pos_name]
-            if "flows" not in pos_group:
+            flows_ds = pos_group.get("flows")
+            if flows_ds is None:
+                flows_ds = pos_group.get("flows_post_ffn")
+            if flows_ds is None:
                 continue
-            flows = pos_group["flows"][:].astype(np.float32)
+            flows = flows_ds[:].astype(np.float32)
             true_carry = pos_group.get("true_in_carry")
+            if true_carry is None:
+                true_carry = pos_group.get("incoming_carries")
             pred_carry = pos_group.get("pred_in_carry")
+            if pred_carry is None:
+                pred_carry = pos_group.get("outgoing_carries")
             if true_carry is None or pred_carry is None:
                 continue
             true_carry = np.asarray(true_carry[:], dtype=np.float32)
@@ -205,12 +168,21 @@ def load_carry_data_with_sample_ids(
             if pos_name not in positions_group:
                 continue
             pos_group = positions_group[pos_name]
-            if "flows" not in pos_group:
+            flows_ds = pos_group.get("flows")
+            if flows_ds is None:
+                flows_ds = pos_group.get("flows_post_ffn")
+            if flows_ds is None:
                 continue
-            flows = pos_group["flows"][:].astype(np.float32)
+            flows = flows_ds[:].astype(np.float32)
             true_carry = pos_group.get("true_in_carry")
+            if true_carry is None:
+                true_carry = pos_group.get("incoming_carries")
             pred_carry = pos_group.get("pred_in_carry")
+            if pred_carry is None:
+                pred_carry = pos_group.get("outgoing_carries")
             sample_ids_ds = pos_group.get("sample_ids")
+            if sample_ids_ds is None:
+                sample_ids_ds = pos_group.get("sample_indices")
             if true_carry is None or pred_carry is None:
                 continue
             true_carry = np.asarray(true_carry[:], dtype=np.float32)
@@ -391,7 +363,7 @@ def train_single_layer(
 # Main
 # ----------------------------
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Per-layer carry probes for true/pred carries.")
     parser.add_argument("--data-path", type=Path, default=DEFAULT_DATA_PATH, help="Path to HDF5 results file")
     parser.add_argument("--probe-type", type=str, choices=["linear", "mlp", "circular"], default=DEFAULT_PROBE_TYPE)
@@ -406,15 +378,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--head-layer", type=int, default=None, help="Layer index for head-specific probe on true_in_carry")
     parser.add_argument("--head-index", type=int, default=None, help="Head index to slice (requires num-heads)")
     parser.add_argument("--num-heads", type=int, default=None, help="Total number of heads for slicing features evenly")
-    return parser.parse_args()
+    parser.add_argument("--log-dir", type=Path, default=LOG_DIR)
+    parser.add_argument("--save-dir", type=Path, default=SAVE_DIR)
+    return parser.parse_args(argv)
 
 
-def main() -> None:
-    args = parse_args()
+def main(argv=None) -> None:
+    args = parse_args(argv)
     set_seed(args.seed)
 
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    SAVE_DIR.mkdir(parents=True, exist_ok=True)
+    log_dir = args.log_dir
+    save_dir = args.save_dir
+    log_dir.mkdir(parents=True, exist_ok=True)
+    save_dir.mkdir(parents=True, exist_ok=True)
 
     print("Configuration:")
     print(f"  data_path: {args.data_path}")
@@ -544,7 +520,7 @@ def main() -> None:
         # Save best probe model
         model_to_save = best_item.get("model")
         if model_to_save is not None:
-            save_path = SAVE_DIR / f"incarry_{target_name}_layer{best_item['layer']}.pt"
+            save_path = save_dir / f"incarry_{target_name}_layer{best_item['layer']}.pt"
             torch.save(
                 {
                     "model_state": model_to_save.state_dict(),
@@ -569,7 +545,7 @@ def main() -> None:
         print(f"  -> {line}")
         model_to_save = head_best.get("model")
         if model_to_save is not None:
-            save_path = SAVE_DIR / (
+            save_path = save_dir / (
                 f"incarry_true_head{head_best['head_index']}_layer{head_best['layer']}_h{head_best['num_heads']}.pt"
             )
             torch.save(
@@ -588,7 +564,7 @@ def main() -> None:
 
     # Write best summaries to log file
     if best_log_lines:
-        log_path = LOG_DIR / "incarry_best.log"
+        log_path = log_dir / "incarry_best.log"
         with open(log_path, "a", encoding="utf-8") as f:
             f.write("\n".join(best_log_lines) + "\n")
         print(f"Best summaries appended to {log_path}")

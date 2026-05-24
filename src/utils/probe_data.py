@@ -7,9 +7,7 @@ import numpy as np
 
 
 def compute_raw_sum(question: str, sum_pos: int) -> int:
-    """
-    计算指定位置的本位和（各加数在该位置的数字之和，不取模）。
-    """
+    """Compute the positional digit sum without applying modulo."""
     try:
         operands = []
         for part in question.split("+"):
@@ -46,10 +44,7 @@ def compute_raw_sum(question: str, sum_pos: int) -> int:
 
 
 def compute_c_potential(question: str, current_pos: int) -> float:
-    """
-    计算 C_potential (Potential of Truth)
-    公式: C_potential(pos) = sum( raw_sum(k) / 10^(k-pos) ) for k = pos+1 to end
-    """
+    """Compute the C_potential (Potential of Truth) score."""
     try:
         operands = []
         for part in question.split("+"):
@@ -96,9 +91,52 @@ def _to_str_list(arr) -> List[str]:
     return out
 
 
+def parse_question_operands(question: str) -> List[int]:
+    operands: List[int] = []
+    for part in question.split("+"):
+        part = part.strip()
+        if part.isdigit():
+            operands.append(int(part))
+    return operands
+
+
+def load_h5_sample_metadata(h5_path: Path) -> Tuple[Dict[int, str], Dict[int, str]]:
+    questions: Dict[int, str] = {}
+    gts: Dict[int, str] = {}
+    with h5py.File(h5_path, "r") as hf:
+        samples_group = hf.get("samples")
+        if samples_group is None:
+            return questions, gts
+        sample_idx_ds = samples_group.get("sample_idx")
+        question_ds = samples_group.get("question")
+        gt_ds = samples_group.get("gt")
+        if sample_idx_ds is None or question_ds is None:
+            return questions, gts
+
+        sample_ids = np.asarray(sample_idx_ds, dtype=np.int64)
+        question_values = _to_str_list(question_ds)
+        gt_values = _to_str_list(gt_ds) if gt_ds is not None else []
+        for row, sample_id in enumerate(sample_ids.tolist()):
+            if row < len(question_values):
+                questions[int(sample_id)] = question_values[row]
+            if row < len(gt_values):
+                gts[int(sample_id)] = gt_values[row]
+    return questions, gts
+
+
+def load_h5_sample_dataset(h5_path: Path) -> Dict[int, List[int]]:
+    questions, _ = load_h5_sample_metadata(h5_path)
+    return {
+        sample_id: operands
+        for sample_id, question in questions.items()
+        if (operands := parse_question_operands(question))
+    }
+
+
 def load_positions(h5_path: Path) -> Dict[int, Dict[str, np.ndarray]]:
     positions: Dict[int, Dict[str, np.ndarray]] = {}
     with h5py.File(h5_path, "r") as hf:
+        sample_questions, sample_gts = load_h5_sample_metadata(h5_path)
         positions_group = hf["all_token_results"]
         for pos_name, pos_group in positions_group.items():
             if not pos_name.startswith("pos_"):
@@ -108,13 +146,18 @@ def load_positions(h5_path: Path) -> Dict[int, Dict[str, np.ndarray]]:
             except Exception:
                 continue
 
-            flows = np.asarray(pos_group.get("flows"))
+            flows_ds = pos_group.get("flows")
+            if flows_ds is None:
+                flows_ds = pos_group.get("flows_post_ffn")
+            flows = np.asarray(flows_ds)
             labels = np.asarray(pos_group.get("labels"), dtype=np.bool_)
             preds = _to_str_list(pos_group.get("preds"))
             gt_chars = _to_str_list(pos_group.get("gt_chars"))
             true_carry = pos_group.get("true_in_carry")
             pred_carry = pos_group.get("pred_in_carry")
             sample_ids_ds = pos_group.get("sample_ids")
+            if sample_ids_ds is None:
+                sample_ids_ds = pos_group.get("sample_indices")
             sample_ids = np.asarray(sample_ids_ds) if sample_ids_ds is not None else None
             positions[pos_idx] = {
                 "flows": flows,
@@ -124,6 +167,8 @@ def load_positions(h5_path: Path) -> Dict[int, Dict[str, np.ndarray]]:
                 "true_carry": np.asarray(true_carry) if true_carry is not None else None,
                 "pred_carry": np.asarray(pred_carry) if pred_carry is not None else None,
                 "sample_ids": sample_ids,
+                "sample_questions": sample_questions,
+                "sample_gts": sample_gts,
             }
     return positions
 
@@ -133,7 +178,7 @@ def build_flat_dataset(
     positions: Dict[int, Dict[str, np.ndarray]],
     positions_filter: List[int] | None = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """按 sample_id 对齐每个位置的 flows 与原始 dataset 计算标签。"""
+    """Align per-position flows with the underlying dataset to derive labels."""
     flows_list: List[np.ndarray] = []
     raw_labels: List[int] = []
     carry_labels: List[float] = []
@@ -151,17 +196,28 @@ def build_flat_dataset(
         preds = data["preds"]
         gt_chars = data["gt_chars"]
         ids = data.get("sample_ids")
+        sample_questions = data.get("sample_questions", {})
+        sample_gts = data.get("sample_gts", {})
 
         if ids is not None:
             max_rows = min(len(flows), len(preds), len(gt_chars), len(ids))
             for row in range(max_rows):
                 sid = int(ids[row])
-                if not (0 <= sid < len(dataset)):
-                    continue
-                operands = dataset[sid]
-                question = " + ".join(str(x) for x in operands)
-                gt_value = sum(operands)
-                gt_str = str(gt_value)
+                if sid in sample_questions:
+                    question = sample_questions[sid]
+                    gt_str = str(sample_gts.get(sid, ""))
+                    if not gt_str:
+                        operands = parse_question_operands(question)
+                        if not operands:
+                            continue
+                        gt_str = str(sum(operands))
+                else:
+                    if not (0 <= sid < len(dataset)):
+                        continue
+                    operands = dataset[sid]
+                    question = " + ".join(str(x) for x in operands)
+                    gt_value = sum(operands)
+                    gt_str = str(gt_value)
                 if pos_idx >= len(gt_str):
                     continue
                 if gt_chars[row] != gt_str[pos_idx]:
@@ -178,46 +234,37 @@ def build_flat_dataset(
 
                 flows_list.append(flows[row])
                 raw_labels.append(raw_mod)
-                carry_labels.append(float(c_potential))
+                carry_labels.append(c_potential)
                 gt_digits.append(int(gt_str[pos_idx]))
                 pred_digits.append(pred_digit)
                 sample_ids.append(sid)
                 pos_ids.append(pos_idx)
         else:
-            max_rows = min(len(dataset), len(flows), len(preds), len(gt_chars))
-            for sample_idx in range(max_rows):
-                operands = dataset[sample_idx]
+            for flow_idx, flow in enumerate(flows):
+                if flow_idx >= len(dataset):
+                    break
+                operands = dataset[flow_idx]
                 question = " + ".join(str(x) for x in operands)
                 gt_value = sum(operands)
                 gt_str = str(gt_value)
                 if pos_idx >= len(gt_str):
                     continue
-                if gt_chars[sample_idx] != gt_str[pos_idx]:
-                    continue
-
                 raw_sum_val = compute_raw_sum(question, pos_idx)
                 if raw_sum_val < 0:
                     continue
                 raw_mod = raw_sum_val % 10
                 c_potential = compute_c_potential(question, pos_idx)
 
-                pred_token = preds[sample_idx]
-                pred_digit = int(pred_token) if str(pred_token).isdigit() else -1
-
-                flows_list.append(flows[sample_idx])
+                flows_list.append(flow)
                 raw_labels.append(raw_mod)
-                carry_labels.append(float(c_potential))
+                carry_labels.append(c_potential)
                 gt_digits.append(int(gt_str[pos_idx]))
-                pred_digits.append(pred_digit)
-                sample_ids.append(sample_idx)
+                pred_digits.append(-1)
+                sample_ids.append(flow_idx)
                 pos_ids.append(pos_idx)
 
-    if not flows_list:
-        raise RuntimeError("No samples built from H5/dataset alignment.")
-
-    flows_all = np.stack(flows_list, axis=0)
     return (
-        flows_all,
+        np.asarray(flows_list, dtype=np.float32),
         np.asarray(raw_labels, dtype=np.int64),
         np.asarray(carry_labels, dtype=np.float32),
         np.asarray(gt_digits, dtype=np.int64),
