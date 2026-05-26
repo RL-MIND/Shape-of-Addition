@@ -53,7 +53,7 @@ COMMA_HANDLING_MODE = 'abandon'  # 'skip' or 'abandon'
 # Whether to check all tokens
 # True: evaluate and store every token
 # False: stop after the first incorrect token (if all are correct, still check one extra position)
-CHECK_ALL_TOKENS = False
+CHECK_ALL_TOKENS = True
 
 # Save results every N processed samples
 SAVE_INTERVAL = 200

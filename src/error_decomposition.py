@@ -388,6 +388,7 @@ def load_processed_task_data(
     h5_path: Path,
     pos: int,
     model_path: str,
+    sign: str,
     seed: int,
     train_target: str,
     balance_mode: str,
@@ -426,6 +427,7 @@ def load_processed_task_data(
         input_pos="consistent",
         filter_prefix_correct=None,
         loaded_model_obj=loaded_model_obj,
+        sign=sign,
     )
 
 
@@ -1362,6 +1364,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--h5", type=Path, default=DEFAULT_H5)
     parser.add_argument("--dataset", type=Path, default=Path("data/num3len10-10000.pkl"), help="Fallback dataset used only when the H5 file lacks sample metadata.")
     parser.add_argument("--pos", type=int, default=DEFAULT_POS)
+    parser.add_argument("--sign", type=str, choices=["plus", "mul", "sub", "div"], default="plus", help="Arithmetic operator for target construction; defaults to plus.")
     parser.add_argument("--model", type=str, default="Qwen/Qwen3-4B", help="Model path used to extract final-norm parameters.")
     parser.add_argument("--out-dir", type=str, default=str(DEFAULT_OUTDIR))
     parser.add_argument("--seed", type=int, default=42)
@@ -1429,6 +1432,7 @@ def main(argv=None) -> None:
             h5_path=args.h5,
             pos=args.pos,
             model_path=args.model,
+            sign=args.sign,
             seed=args.seed,
             train_target="raw_sum_classify",
             balance_mode="none",
@@ -1440,6 +1444,7 @@ def main(argv=None) -> None:
             h5_path=args.h5,
             pos=args.pos,
             model_path=args.model,
+            sign=args.sign,
             seed=args.seed,
             train_target="C_potential",
             balance_mode="none",

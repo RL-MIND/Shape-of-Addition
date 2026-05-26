@@ -1161,7 +1161,8 @@ def load_and_process_data(file_path, position_select='all', feature_type='flows'
                           model_type=None, has_h5py=True, target_pos='consistent',
                           input_pos='consistent',
                           filter_prefix_correct=None,
-                          loaded_model_obj=None):
+                          loaded_model_obj=None,
+                          sign=None):
     """
     Load and preprocess data produced by generate.py.
     
@@ -1188,6 +1189,9 @@ def load_and_process_data(file_path, position_select='all', feature_type='flows'
             'prefix_correct': all positions before TARGET_POS correct
             'prefix_incorrect': at least one prefix position wrong
             None: no prefix filter
+        sign: Optional arithmetic sign override. When set to 'plus', raw-sum and
+            carry-potential targets are treated as addition targets without
+            relying on the file name.
     
     Returns:
         X_all, y_all, y_binary, position_indices, selected_positions,
@@ -1352,7 +1356,7 @@ def load_and_process_data(file_path, position_select='all', feature_type='flows'
                 print("  Continuing with raw hidden states.")
     
     # Dataset type (add/mul) and task type (classification/regression)
-    is_addition_dataset = is_addition_dataset_path(file_path)
+    is_addition_dataset = str(sign).lower() in {"plus", "add", "addition", "+"} if sign is not None else is_addition_dataset_path(file_path)
     # Carry filter from apply_carry_filter or train_target default
     if apply_carry_filter is None:
         is_carry_target = effective_train_target in ['incoming_carry', 'outgoing_carry']
@@ -1366,7 +1370,7 @@ def load_and_process_data(file_path, position_select='all', feature_type='flows'
     
     # raw_sum targets only for addition datasets
     if effective_train_target in ['raw_sum_classify', 'raw_sum_regress', 'C_potential'] and not is_addition_dataset:
-        raise ValueError(f"TRAIN_TARGET = '{effective_train_target}' only supports addition datasets (filename must contain 'plus')")
+        raise ValueError(f"TRAIN_TARGET = '{effective_train_target}' only supports addition datasets; pass sign='plus' or use an addition HDF5 file.")
     
     # Load samples_meta when raw_sum or text-based filters need question strings
     samples_meta = None
