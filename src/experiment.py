@@ -10,8 +10,8 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from src.utils.metrics import compute_mean_std_ci  # noqa: E402
-from src.utils.probe_data import load_h5_baseline_metrics  # noqa: E402
+from utils.metrics import compute_mean_std_ci  # noqa: E402
+from utils.probe_data import load_h5_baseline_metrics  # noqa: E402
 
 
 COMMON_AGGREGATE_METRIC_KEYS = [

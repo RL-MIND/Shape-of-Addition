@@ -5,8 +5,8 @@ import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from src.utils.model_utils import apply_chat_template_safe
-from src.utils.probe_data import compute_c_potential, compute_raw_sum
+from utils.model_utils import apply_chat_template_safe
+from utils.probe_data import compute_c_potential, compute_raw_sum
 
 
 def _positions_tag(positions: Optional[List[int]]) -> str:

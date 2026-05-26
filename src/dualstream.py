@@ -11,8 +11,8 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from src.models import ProbeMLP, ProbeMLPRegressor
-from src.utils.metrics import (
+from models import ProbeMLP, ProbeMLPRegressor
+from utils.metrics import (
     OFF_BY_ONE_COLS,
     OFF_BY_ONE_ROWS,
     analyze_off_by_one_errors,
@@ -20,9 +20,9 @@ from src.utils.metrics import (
     make_empty_off_by_one_confusion,
     mask_first_error_positions,
 )
-from src.utils.model_utils import apply_chat_template_safe, detect_model_type, get_norm_weight_from_model, setup_prenorm_hook, rms_norm, analyze_last_layer_normalized
+from utils.model_utils import apply_chat_template_safe, detect_model_type, get_norm_weight_from_model, setup_prenorm_hook, rms_norm, analyze_last_layer_normalized
 
-from src.utils.probe_data import (
+from utils.probe_data import (
     build_flat_dataset,
     compute_c_potential,
     compute_raw_sum,
@@ -33,13 +33,13 @@ from src.utils.probe_data import (
     load_positions,
     split_sample_ids,
 )
-from src.utils.probe_utils import (
+from utils.probe_utils import (
     get_digit_token_ids as shared_get_digit_token_ids,
     normalize_layer_index,
     online_baseline_eval,
     resolve_selected_layers,
 )
-from src.utils.verify import (
+from utils.verify import (
     build_dirs_cross_digit,
     collect_records,
     compute_means,
@@ -874,7 +874,7 @@ def run_single_seed(
             torch_dtype="auto",
             output_hidden_states=False,
         )
-        from src.utils.model_utils import get_norm_module
+        from utils.model_utils import get_norm_module
 
         norm_module = get_norm_module(lm_tmp)
         if norm_module is None:
@@ -1290,7 +1290,7 @@ def run_single_seed(
         else:
             dataset_test = [dataset_full[i] for i in sorted(test_ids) if 0 <= i < len(dataset_full)] if test_ids else dataset_full
         # Get norm_weight from the loaded model using the shared helper
-        from src.utils.model_utils import get_norm_module
+        from utils.model_utils import get_norm_module
         norm_module = get_norm_module(lm)
         if norm_module is not None:
             online_norm_weight = norm_module.weight.detach().clone()

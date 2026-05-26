@@ -9,10 +9,10 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from src.models import ProbeMLP
-from src.utils.metrics import analyze_off_by_one_errors, compute_correction_metrics, mask_first_error_positions
+from models import ProbeMLP
+from utils.metrics import analyze_off_by_one_errors, compute_correction_metrics, mask_first_error_positions
 
-from src.utils.model_utils import (
+from utils.model_utils import (
     analyze_last_layer_normalized,
     apply_chat_template_safe,
     get_norm_module,
@@ -20,7 +20,7 @@ from src.utils.model_utils import (
     rms_norm,
     setup_prenorm_hook,
 )
-from src.utils.probe_data import (
+from utils.probe_data import (
     build_flat_dataset,
     compute_token_sample_acc,
     load_h5_sample_dataset,
@@ -29,7 +29,7 @@ from src.utils.probe_data import (
     load_positions,
     split_sample_ids,
 )
-from src.utils.probe_utils import (
+from utils.probe_utils import (
     get_digit_token_ids,
     online_baseline_eval,
     parse_layer_candidates,

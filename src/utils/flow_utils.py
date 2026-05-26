@@ -1018,7 +1018,7 @@ def detect_max_result_len(file_path: str, filter_by_result_len=None):
             - target_result_len: Target digit count (mode if FILTER_BY_RESULT_LEN else max)
             - sample_idx_to_result_len: sample_idx -> result_len
     """
-    from src.utils.flow_utils import load_samples_meta
+    from utils.flow_utils import load_samples_meta
     from collections import Counter
     
     samples_meta = load_samples_meta(file_path)

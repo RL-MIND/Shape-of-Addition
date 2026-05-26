@@ -19,11 +19,11 @@ from sklearn.model_selection import train_test_split
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from src.models import ProbeMLP, ProbeMLPRegressor
-from src.utils import flow_utils as flow_utils_module
-from src.utils.cli import parse_bool_arg
-from src.utils.metrics import get_off_by_one_direction
-from src.utils.probe_data import compute_c_potential, compute_raw_sum, load_dataset
+from models import ProbeMLP, ProbeMLPRegressor
+from utils import flow_utils as flow_utils_module
+from utils.cli import parse_bool_arg
+from utils.metrics import get_off_by_one_direction
+from utils.probe_data import compute_c_potential, compute_raw_sum, load_dataset
 
 
 DEFAULT_H5 = Path("results/activations/plus_num3len10_Qwen3-4b/plus_num3len10_Qwen3-4b.h5")
@@ -1363,7 +1363,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset", type=Path, default=Path("data/num3len10-10000.pkl"), help="Fallback dataset used only when the H5 file lacks sample metadata.")
     parser.add_argument("--pos", type=int, default=DEFAULT_POS)
     parser.add_argument("--model", type=str, default="Qwen/Qwen3-4B", help="Model path used to extract final-norm parameters.")
-    parser.add_argument("--outdir", type=str, default=str(DEFAULT_OUTDIR))
+    parser.add_argument("--out-dir", type=str, default=str(DEFAULT_OUTDIR))
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
@@ -1412,7 +1412,7 @@ def main(argv=None) -> None:
 
     set_global_seed(args.seed)
     device = maybe_get_device(args.device)
-    outdir = normalize_outdir(args.outdir)
+    outdir = normalize_outdir(args.out_dir)
     outdir.mkdir(parents=True, exist_ok=True)
 
     print(f"Loading position data from {args.h5} (pos={args.pos}, layer={args.layer})...")

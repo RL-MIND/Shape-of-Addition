@@ -12,7 +12,7 @@ import torch.optim as optim
 from sklearn.metrics import accuracy_score, roc_auc_score
 from sklearn.model_selection import train_test_split
 
-from src.models import CircularProbe, ProbeMLP
+from models import CircularProbe, ProbeMLP
 
 try:
     import h5py
@@ -365,17 +365,17 @@ def train_single_layer(
 
 def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Per-layer carry probes for true/pred carries.")
-    parser.add_argument("--data-path", type=Path, default=DEFAULT_DATA_PATH, help="Path to HDF5 results file")
+    parser.add_argument("--h5", type=Path, default=DEFAULT_DATA_PATH, help="Path to HDF5 results file")
     parser.add_argument("--probe-type", type=str, choices=["linear", "mlp", "circular"], default=DEFAULT_PROBE_TYPE)
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--lr", type=float, default=DEFAULT_LR)
     parser.add_argument("--weight-decay", type=float, default=DEFAULT_WEIGHT_DECAY)
     parser.add_argument("--patience", type=int, default=DEFAULT_PATIENCE)
-    parser.add_argument("--max-epochs", type=int, default=DEFAULT_MAX_EPOCHS)
+    parser.add_argument("--epochs", type=int, default=DEFAULT_MAX_EPOCHS)
     parser.add_argument("--test-size", type=float, default=DEFAULT_TEST_SIZE)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--include-extra", action="store_true", help="Include extra position if present")
-    parser.add_argument("--head-layer", type=int, default=None, help="Layer index for head-specific probe on true_in_carry")
+    parser.add_argument("--layer", type=int, default=None, help="Layer index for head-specific probe on true_in_carry")
     parser.add_argument("--head-index", type=int, default=None, help="Head index to slice (requires num-heads)")
     parser.add_argument("--num-heads", type=int, default=None, help="Total number of heads for slicing features evenly")
     parser.add_argument("--log-dir", type=Path, default=LOG_DIR)
@@ -393,17 +393,17 @@ def main(argv=None) -> None:
     save_dir.mkdir(parents=True, exist_ok=True)
 
     print("Configuration:")
-    print(f"  data_path: {args.data_path}")
+    print(f"  data_path: {args.h5}")
     print(f"  probe_type: {args.probe_type}")
     print(f"  batch_size: {args.batch_size}")
     print(f"  lr: {args.lr}")
     print(f"  weight_decay: {args.weight_decay}")
     print(f"  patience: {args.patience}")
-    print(f"  max_epochs: {args.max_epochs}")
+    print(f"  max_epochs: {args.epochs}")
     print(f"  test_size: {args.test_size}")
     print(f"  device: {DEVICE}")
 
-    flows, true_carry, pred_carry = load_carry_data(args.data_path, include_extra=args.include_extra)
+    flows, true_carry, pred_carry = load_carry_data(args.h5, include_extra=args.include_extra)
     seq_len, feature_dim = flows.shape[1], flows.shape[2]
     print(f"Loaded total samples: {len(flows)}, seq_len={seq_len}, feature_dim={feature_dim}")
 
@@ -441,7 +441,7 @@ def main(argv=None) -> None:
                     lr=args.lr,
                     weight_decay=args.weight_decay,
                     patience=args.patience,
-                    max_epochs=args.max_epochs,
+                    max_epochs=args.epochs,
                     test_size=args.test_size,
                 )
                 results[target_name].append({
@@ -457,9 +457,9 @@ def main(argv=None) -> None:
 
         # Optional head-specific training for true_in_carry
         if target_name == "true_in_carry" and args.head_index is not None:
-            if args.head_layer is None or args.num_heads is None:
-                print("Head-specific training skipped: both --head-layer and --num-heads are required when --head-index is set.")
-            elif not (0 <= args.head_layer < seq_len):
+            if args.layer is None or args.num_heads is None:
+                print("Head-specific training skipped: both --layer and --num-heads are required when --head-index is set.")
+            elif not (0 <= args.layer < seq_len):
                 print("Head-specific training skipped: head_layer out of range.")
             else:
                 head_dim = feature_dim // args.num_heads
@@ -471,7 +471,7 @@ def main(argv=None) -> None:
                     if end > feature_dim:
                         print("Head-specific training skipped: head_index exceeds available heads.")
                     else:
-                        X_head = X_layers[:, args.head_layer, start:end]
+                        X_head = X_layers[:, args.layer, start:end]
                         try:
                             model, best_acc, best_auc, best_epoch = train_single_layer(
                                 X_head,
@@ -481,11 +481,11 @@ def main(argv=None) -> None:
                                 lr=args.lr,
                                 weight_decay=args.weight_decay,
                                 patience=args.patience,
-                                max_epochs=args.max_epochs,
+                                max_epochs=args.epochs,
                                 test_size=args.test_size,
                             )
                             results.setdefault("true_in_carry_head", []).append({
-                                "layer": args.head_layer,
+                                "layer": args.layer,
                                 "head_index": args.head_index,
                                 "num_heads": args.num_heads,
                                 "acc": best_acc,
@@ -494,7 +494,7 @@ def main(argv=None) -> None:
                                 "model": model,
                             })
                             print(
-                                f"Head slice | Layer {args.head_layer:02d} Head {args.head_index} | true_in_carry | "
+                                f"Head slice | Layer {args.layer:02d} Head {args.head_index} | true_in_carry | "
                                 f"BestAcc {best_acc:.4f} | BestAUC {best_auc:.4f} | Epoch {best_epoch}"
                             )
                         except ValueError as err:

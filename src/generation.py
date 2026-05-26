@@ -4,7 +4,7 @@ import pickle
 import json
 import logging
 import argparse
-from src.utils.cli import str_to_bool
+from utils.cli import str_to_bool
 import os
 import re
 import numpy as np
@@ -14,7 +14,7 @@ from pathlib import Path
 from contextlib import nullcontext
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from src.utils.flow_utils import extract_position_key
+from utils.flow_utils import extract_position_key
 
 
 
@@ -1100,8 +1100,8 @@ def parse_cli_args():
     parser = argparse.ArgumentParser(
         description="Generate arithmetic answers and save vertical-flow activations."
     )
-    parser.add_argument("--model-path", default=MODEL_PATH, help="Hugging Face model path or name.")
-    parser.add_argument("--dataset", "--data-path", dest="data_path", default=DATA_PATH, help="Pickle dataset path.")
+    parser.add_argument("--model", default=MODEL_PATH, help="Hugging Face model path or name.")
+    parser.add_argument("--dataset", dest="data_path", default=DATA_PATH, help="Pickle dataset path.")
     parser.add_argument("--sign", default=SIGN, choices=["plus", "mul", "sub", "div"], help="Arithmetic operator.")
     parser.add_argument("--max-new-tokens", type=int, default=MAX_NEW_TOKENS, help="Maximum generated tokens per sample.")
     parser.add_argument("--max-samples", type=int, default=MAX_SAMPLES, help="Number of valid samples to process.")
@@ -1109,7 +1109,7 @@ def parse_cli_args():
     parser.add_argument("--check-all-tokens", type=str_to_bool, default=CHECK_ALL_TOKENS, help="Whether to evaluate all answer tokens.")
     parser.add_argument("--save-interval", type=int, default=SAVE_INTERVAL, help="Checkpoint interval in processed samples.")
     parser.add_argument("--seed", type=int, default=SEED, help="Random seed.")
-    parser.add_argument("--log-dir", default=LOG_DIR, help="Directory for generation logs.")
+    parser.add_argument("--out-dir", default=LOG_DIR, help="Directory for generation logs.")
     parser.add_argument("--output-h5", default=None, help="Explicit HDF5 output path.")
     return parser.parse_args()
 
@@ -1120,12 +1120,12 @@ def parse_cli_args():
 
 def main():
     args = parse_cli_args()
-    model_short_name = simplify_model_path(args.model_path)
+    model_short_name = simplify_model_path(args.model)
     dataset_stem = Path(args.data_path).stem.split("-")[0]
     results_path_h5 = args.output_h5 or f"results/{args.sign}_{dataset_stem}_{model_short_name}_nocheckall_balance_both.h5"
 
     # Initialize logger
-    logger = setup_logger(args.log_dir)
+    logger = setup_logger(args.out_dir)
 
     # Set random seed
     set_seed(args.seed)
@@ -1134,7 +1134,7 @@ def main():
     # Log configuration
     logger.info("=" * 50)
     logger.info("Configuration:")
-    logger.info(f"  args.model_path: {args.model_path}")
+    logger.info(f"  args.model: {args.model}")
     logger.info(f"  args.data_path: {args.data_path}")
     logger.info(f"  args.sign: {args.sign}")
     logger.info(f"  args.max_new_tokens: {args.max_new_tokens}")
@@ -1150,9 +1150,9 @@ def main():
 
     # Load model
     logger.info("Loading model...")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path, use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
     model = AutoModelForCausalLM.from_pretrained(
-        args.model_path,
+        args.model,
         output_hidden_states=True,
         dtype="auto",
         device_map=DEVICE,

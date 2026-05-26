@@ -4,15 +4,22 @@ PCA Plot Script - 2D PCA Visualization for Vertical Flow Data
 Based on umap_plot_script.py, simplified for PCA visualization.
 """
 
+from pathlib import Path as _Path
+import sys as _sys
+
+_SRC_DIR = _Path(__file__).resolve().parents[1]
+if str(_SRC_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_SRC_DIR))
+
 import argparse
-from src.utils.cli import parse_position_arg, str_to_bool
+from utils.cli import parse_position_arg, str_to_bool
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
 from pathlib import Path
 from sklearn.decomposition import PCA
-from src.utils.flow_utils import load_and_process_data
-from src.utils.flow_utils import (
+from utils.flow_utils import load_and_process_data
+from utils.flow_utils import (
     load_token_meta_aligned,
     load_all_token_results,
     select_positions_extended,
@@ -183,7 +190,7 @@ parse_position = parse_position_arg
 
 def parse_cli_args():
     parser = argparse.ArgumentParser(description="Reproduce vertical-flow PCA visualizations.")
-    parser.add_argument("--data-path", "--h5", dest="data_path", default=DATA_PATH)
+    parser.add_argument("--h5", "--h5", dest="data_path", default=DATA_PATH)
     parser.add_argument("--balance-mode", choices=["none", "normal", "strong"], default=BALANCE_MODE)
     parser.add_argument("--position", "--position-select", dest="position_select", type=parse_position, default=POSITION_SELECT)
     parser.add_argument("--feature-type", default=FEATURE_TYPE)
@@ -205,7 +212,7 @@ def apply_cli_args(args):
 
 def main():
     args = apply_cli_args(parse_cli_args())
-    data_path = args.data_path
+    data_path = args.h5
     balance_mode = args.balance_mode
     position_select = args.position_select
     feature_type = args.feature_type

@@ -1,6 +1,13 @@
+from pathlib import Path as _Path
+import sys as _sys
+
+_SRC_DIR = _Path(__file__).resolve().parents[1]
+if str(_SRC_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_SRC_DIR))
+
 import os
 import argparse
-from src.utils.cli import parse_position_arg, str_to_bool
+from utils.cli import parse_position_arg, str_to_bool
 # Set thread-control env vars before importing other libs (must be set before import to take effect)
 # These env vars affect NumPy, pynndescent, and other libs using OpenMP/BLAS
 _UMAP_N_JOBS = os.environ.get('UMAP_N_JOBS', '16')
@@ -27,8 +34,8 @@ except ImportError as exc:
     umap = None
     AlignedUMAP = None
     UMAP_IMPORT_ERROR = exc
-from src.utils.flow_utils import load_and_process_data
-from src.utils.flow_utils import (
+from utils.flow_utils import load_and_process_data
+from utils.flow_utils import (
     load_token_meta_aligned,
     balance_indices_numpy,
     balance_indices_per_position_numpy,
@@ -504,7 +511,7 @@ def evaluate_pretrained_model(X_all_raw, y_binary, saved_config, saved_model_sta
         data_path: data path for reload when needed
         load_kwargs: extra args for load_and_process_data
     """
-    from src.models import create_model
+    from models import create_model
     from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, roc_auc_score
     import torch
     import numpy as np
@@ -543,7 +550,7 @@ def evaluate_pretrained_model(X_all_raw, y_binary, saved_config, saved_model_sta
     if need_reload and data_path is not None:
         import io
         import contextlib
-        from src.utils.flow_utils import load_and_process_data
+        from utils.flow_utils import load_and_process_data
         reload_kwargs = dict(load_kwargs) if load_kwargs else {}
         # Suppress verbose output (summary only)
         captured_output = io.StringIO()
@@ -2368,7 +2375,7 @@ def run_umap_and_plot_v2(X_all_raw, y_all, selected_indices,
             # Interactive HTML when enabled
             if EXPORT_INTERACTIVE_HTML and sample_indices_sampled is not None and data_path is not None:
                 from interactive_umap_html import create_interactive_html
-                from src.utils.flow_utils import load_samples_meta
+                from utils.flow_utils import load_samples_meta
                 samples_meta = load_samples_meta(data_path)
                 
                 # Output directory
@@ -2745,13 +2752,13 @@ parse_position = parse_position_arg
 
 def parse_cli_args():
     parser = argparse.ArgumentParser(description="Reproduce vertical-flow UMAP visualizations.")
-    parser.add_argument("--data-path", "--h5", dest="data_path", default=DATA_PATH)
+    parser.add_argument("--h5", "--h5", dest="data_path", default=DATA_PATH)
     parser.add_argument("--position", "--position-select", dest="position_select", type=parse_position, default=POSITION_SELECT)
     parser.add_argument("--layer", dest="umap_layer_index", type=parse_position, default=UMAP_LAYER_INDEX)
     parser.add_argument("--feature-type", default=FEATURE_TYPE)
     parser.add_argument("--pooling", default=POOLING, choices=["none", "avg", "max"])
     parser.add_argument("--model-backend", choices=["hf", "quanta"], default=MODEL_BACKEND)
-    parser.add_argument("--model-path", default=MODEL_PATH)
+    parser.add_argument("--model", default=MODEL_PATH)
     parser.add_argument("--apply-model-norm", type=str_to_bool, default=APPLY_MODEL_NORM)
     parser.add_argument("--marker-mode", dest="umap_marker_mode", default=UMAP_MARKER_MODE)
     parser.add_argument("--color-mode", dest="umap_color_mode", choices=["consistent", "prefix_is_correct"], default=UMAP_COLOR_MODE)
@@ -2775,13 +2782,13 @@ def parse_cli_args():
 def apply_cli_args(args):
     """Apply CLI values to legacy module-level settings used by plotting helpers."""
     updates = {
-        "DATA_PATH": args.data_path,
+        "DATA_PATH": args.h5,
         "POSITION_SELECT": args.position_select,
         "UMAP_LAYER_INDEX": args.umap_layer_index,
         "FEATURE_TYPE": args.feature_type,
         "POOLING": args.pooling,
         "MODEL_BACKEND": args.model_backend,
-        "MODEL_PATH": args.model_path,
+        "MODEL_PATH": args.model,
         "APPLY_MODEL_NORM": args.apply_model_norm,
         "UMAP_MARKER_MODE": args.umap_marker_mode,
         "UMAP_COLOR_MODE": args.umap_color_mode,

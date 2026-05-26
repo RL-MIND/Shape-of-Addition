@@ -12,6 +12,13 @@ Usage:
     python cluster_center_distance.py
 """
 
+from pathlib import Path as _Path
+import sys as _sys
+
+_SRC_DIR = _Path(__file__).resolve().parents[1]
+if str(_SRC_DIR) not in _sys.path:
+    _sys.path.insert(0, str(_SRC_DIR))
+
 import os
 import numpy as np
 import torch
@@ -26,7 +33,7 @@ except ImportError:
     print("Error: please install h5py: pip install h5py")
     exit(1)
 
-from src.utils.flow_utils import load_samples_meta
+from utils.flow_utils import load_samples_meta
 
 
 # CUDA_VISIBLE_DEVICES=2 python cluster_center_distance.py
