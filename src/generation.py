@@ -248,21 +248,21 @@ class CapturePostAttnResidual:
             self._buffer.clear()
 
 
-def get_vertical_flow(hidden_states):
-    """Get vertical flow during the prefill phase."""
-    vertical_dict = {}
+def get_activation_trace(hidden_states):
+    """Get residual-stream activations during the prefill phase."""
+    activation_trace = {}
     prompt_seq_len = hidden_states[0][0].shape[1]
     
     for token_idx in range(prompt_seq_len):
-        flow = torch.stack([
+        activation = torch.stack([
             layer.detach().float().cpu().squeeze(0)[token_idx] 
             for layer in hidden_states[0]
         ], dim=0)
-        vertical_dict[token_idx] = {
+        activation_trace[token_idx] = {
             "token_idx": token_idx,
-            "flow": flow  # shape: (L, hid_dim)
+            "flow": activation  # shape: (L, hid_dim)
         }
-    return vertical_dict
+    return activation_trace
 
 
 def get_gen_token_flow(hidden_states, gen_token_idx, pre_norm_states=None):
@@ -1098,7 +1098,7 @@ def balance_dataset_by_carry_and_digit(dataset, pos, logger, carry_ratio=None):
 def parse_cli_args():
     """Parse command-line overrides while keeping paper-reproduction defaults."""
     parser = argparse.ArgumentParser(
-        description="Generate arithmetic answers and save vertical-flow activations."
+        description="Generate arithmetic answers and save residual-stream activations."
     )
     parser.add_argument("--model", default=MODEL_PATH, help="Hugging Face model path or name.")
     parser.add_argument("--dataset", dest="data_path", default=DATA_PATH, help="Pickle dataset path.")

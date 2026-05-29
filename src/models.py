@@ -1,4 +1,4 @@
-﻿"""Model definitions for vertical flow probing."""
+"""Model definitions for residual-stream probing."""
 
 import math
 import torch

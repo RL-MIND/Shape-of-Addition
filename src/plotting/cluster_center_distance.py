@@ -44,7 +44,7 @@ from utils.flow_utils import load_samples_meta
 # ==========================================
 
 # --- Data file path ---
-DATA_FILE_PATH = '/home/wenliuyuan/vertical-flow/results/activations/plus_num3len10_Qwen3-4B_nocheckall_balance.h5'
+DATA_FILE_PATH = '/home/wenliuyuan/activations/results/activations/plus_num3len10_Qwen3-4B_nocheckall_balance.h5'
 # DATA_FILE_PATH = 'results/activations/plus_num4len10_Qwen3-4B'
 
 # --- Position selection (which position's data to use) ---
@@ -61,7 +61,7 @@ DISTANCE_METRIC = 'cosine'  # 'euclidean', 'cosine'
 
 RAW_SUM = 8
 # Note: The "reference center" for the Distance vs C_potential plot comes from PLOT_SAMPLE_LABELS[0].
-# Label order matches vertical-flow/cluster_center_distance.py for consistent plots.
+# Label order matches the activation-analysis script for consistent plots.
 _A = RAW_SUM
 _B = (RAW_SUM + 1)%10
 _C = (RAW_SUM + 2)%10

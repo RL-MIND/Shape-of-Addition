@@ -91,9 +91,9 @@ SKIP_LAYER_0 = True   # True, False: skip layer 0 (when computing all layers; in
 
 # Model path and norm settings
 # MODEL_BACKEND = "quanta"  # "hf" | "quanta"
-# MODEL_PATH = "/home/wenliuyuan/vertical-flow/quanta_maths/models/add_d10_l2_h3_t40K_s572091"
-# MODEL_PATH = "/home/wenliuyuan/vertical-flow/quanta_maths/models/add_d20_l2_h3_t80K_s572091"
-# MODEL_PATH = "/home/wenliuyuan/vertical-flow/quanta_maths/models/mix_d13_l3_h4_t85K_s572091"
+# MODEL_PATH = "/home/wenliuyuan/activations/quanta_maths/models/add_d10_l2_h3_t40K_s572091"
+# MODEL_PATH = "/home/wenliuyuan/activations/quanta_maths/models/add_d20_l2_h3_t80K_s572091"
+# MODEL_PATH = "/home/wenliuyuan/activations/quanta_maths/models/mix_d13_l3_h4_t85K_s572091"
 
 MODEL_BACKEND = "hf"
 MODEL_PATH = "Qwen/Qwen3-4B"
@@ -2751,7 +2751,7 @@ parse_position = parse_position_arg
 
 
 def parse_cli_args():
-    parser = argparse.ArgumentParser(description="Reproduce vertical-flow UMAP visualizations.")
+    parser = argparse.ArgumentParser(description="Reproduce residual-stream UMAP visualizations.")
     parser.add_argument("--h5", "--h5", dest="data_path", default=DATA_PATH)
     parser.add_argument("--position", "--position-select", dest="position_select", type=parse_position, default=POSITION_SELECT)
     parser.add_argument("--layer", dest="umap_layer_index", type=parse_position, default=UMAP_LAYER_INDEX)

@@ -54,7 +54,7 @@ The repository includes arithmetic datasets under `data/`. `num2len5-10000.pkl` 
 
 ## Quick Start
 
-### Step 1 — Generate vertical-flow activations
+### Step 1 — Generate residual-stream activations
 
 ```bash
 python src/generation.py \

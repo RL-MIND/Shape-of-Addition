@@ -1,5 +1,5 @@
 """
-Shared utilities for vertical-flow processing and result loading.
+Shared utilities for residual-stream activation processing and result loading.
 
 Extracted common logic from generate.py, classifier.py, and flow_diff.py:
 - Position selection parsing

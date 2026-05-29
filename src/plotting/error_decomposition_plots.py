@@ -32,12 +32,12 @@ DEFAULT_MAX_POINTS_PER_GROUP = 200
 
 UMAP_SCRIPT_CANDIDATES = [
     REPO_ROOT / "src" / "plotting" / "umap_plots.py",
-    Path(r"Y:\vertical-flow\umap_plot_script.py"),
-    Path("/home/wenliuyuan/vertical-flow/umap_plot_script.py"),
+    Path(r"Y:\activations\umap_plot_script.py"),
+    Path("/home/wenliuyuan/activations/umap_plot_script.py"),
 ]
 FONT_PATH_CANDIDATES = [
     REPO_ROOT / "times.ttf",
-    Path("/home/wenliuyuan/vertical-flow/times.ttf"),
+    Path("/home/wenliuyuan/activations/times.ttf"),
 ]
 
 FIGURE_SIZE_2D = (6, 4)

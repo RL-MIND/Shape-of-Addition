@@ -1,5 +1,5 @@
 """
-PCA Plot Script - 2D PCA Visualization for Vertical Flow Data
+PCA Plot Script - 2D PCA Visualization for residual-stream activation data
 
 Based on umap_plot_script.py, simplified for PCA visualization.
 """
@@ -189,7 +189,7 @@ parse_position = parse_position_arg
 
 
 def parse_cli_args():
-    parser = argparse.ArgumentParser(description="Reproduce vertical-flow PCA visualizations.")
+    parser = argparse.ArgumentParser(description="Reproduce residual-stream PCA visualizations.")
     parser.add_argument("--h5", "--h5", dest="data_path", default=DATA_PATH)
     parser.add_argument("--balance-mode", choices=["none", "normal", "strong"], default=BALANCE_MODE)
     parser.add_argument("--position", "--position-select", dest="position_select", type=parse_position, default=POSITION_SELECT)
