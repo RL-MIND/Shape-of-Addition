@@ -8,7 +8,7 @@
 
   Large Language Models exhibit paradoxical fragility in fundamental arithmetic, implying a disconnect between internal computation and discrete output. By analyzing the residual stream geometry during multi-operand addition, we identify the Iso-Raw-Sum Trajectory (IRST), a geometric structure where representations are anchored by semantic digits and modulated by continuous carry fibers. We propose the Noisy Quantization Model to explain this geometry, framing arithmetic errors as Geometric Slippages caused by internal neural noise pushing a continuous, latent Carry Potential across quantization thresholds. This geometric framework further elucidates Probe Versatility, explaining how lightweight probes can disentangle coexisting latent signals (such as ground truth versus hallucination) from a single activation vector. Finally, we validate these insights through a geometric consistency check method that effectively detects and corrects these quantization failures during inference.
 
-![Vertical Flow overview](assets/plot_probes.png)
+<img src="assets/plot_probes.png" width="800" alt="Shape-of-Addition overview">
 
 
 ---
@@ -16,12 +16,12 @@
 ## Repository Layout
 
 ```text
-VerticalFlow/
+Shape-of-Addition/
 ├── assets/                     
 ├── data/                       # Arithmetic datasets in pickle format
 ├── results/                    
 ├── src/                        
-│   ├── generation.py           # Generate answers and save vertical-flow activations
+│   ├── generation.py           # Generate answers and save activation traces
 │   ├── experiment.py           # Unified correction-method runner
 │   ├── mlp_probe.py            
 │   ├── linear_probe.py         
@@ -41,7 +41,7 @@ VerticalFlow/
 
 ```bash
 pip install -r requirements.txt
-cd VerticalFlow
+cd Shape-of-Addition
 ```
 
 ---
@@ -165,4 +165,3 @@ For questions or issues, please:
 - Open an issue on GitHub
   
 - Contact the authors at [lywen@smail.nju.edu.cn]
-

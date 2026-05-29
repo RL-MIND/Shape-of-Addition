@@ -1,1 +1,1 @@
-"""Utility helpers for VerticalFlow."""
+"""Utility helpers for Shape-of-Addition."""

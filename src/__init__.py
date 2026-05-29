@@ -1,1 +1,1 @@
-"""VerticalFlow source package."""
+"""Shape-of-Addition source package."""
