@@ -148,12 +148,12 @@ results/
 If you find this work useful, please cite:
 
 ```bibtex
-@inproceedings{
-shapeofaddition,
-title={The Shape of Addition: Geometric Structures of Arithmetic in Large Language Models},
-author={Anonymous},
-booktitle={Forty-third International Conference on Machine Learning},
-year={2026}
+@inproceedings{wen2026shapeofaddition,
+  title     = {{The Shape of Addition: Geometric Structures of Arithmetic in Large Language Models}},
+  author    = {Liuyuan Wen and Xun Zhu and Lihao Huang and Wenbin Li and Yang Gao},
+  booktitle = {Proceedings of the 2026 International Conference on Machine Learning (ICML)},
+  publisher = {PMLR},
+  year      = {2026}
 }
 ```
 
